@@ -1,0 +1,14 @@
+{
+  "python.defaultInterpreterPath": "C:\\Users\\Shayahn-DKE\\anaconda3\\envs\\copd\\python.exe",
+  "terminal.integrated.defaultProfile.windows": "Command Prompt",
+  "terminal.integrated.profiles.windows": {
+    "Command Prompt": {
+      "path": "C:\\Windows\\System32\\cmd.exe",
+      "args": [
+        "/K",
+        "C:\\Users\\Shayahn-DKE\\anaconda3\\Scripts\\activate.bat C:\\Users\\Shayahn-DKE\\anaconda3 && conda activate copd"
+      ]
+    }
+  },
+  "python.terminal.activateEnvironment": true
+}
