@@ -59,3 +59,5 @@ Development of a Predictive Model for Lung Function Decline, Symptom Onset, and 
 
 --------
 
+Run the code: python -m src.main
+

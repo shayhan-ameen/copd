@@ -1,29 +1,709 @@
+# -*- coding: utf-8 -*-
 from pathlib import Path
+import re
+from typing import Dict, Iterable, List, Tuple
 
+import matplotlib.pyplot as plt
+import matplotlib
+import pandas as pd
+
+#
+from pptx import Presentation
+from pptx.util import Inches, Pt
+from src import dataset
+from src.config import INTERIM_DATA_DIR, FIGURES_DIR
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import os
+import numpy as np
 from loguru import logger
 from tqdm import tqdm
-import typer
 
-from src.config import FIGURES_DIR, PROCESSED_DATA_DIR
+# # ------------------------------- Config -------------------------------- #
 
-app = typer.Typer()
+# WANTED_MEASURE_INDEXES = ["FEV1", "FVC", "FEV1/FVC", "DLCO", "DLCO/VA"]
+
+# MEASURE_INDEX_COLORS: Dict[str, str] = {
+#     "FEV1": "tab:blue",
+#     "FVC": "tab:orange",
+#     "FEV1/FVC": "tab:green",
+#     "DLCO": "tab:red",
+#     "DLCO/VA": "tab:purple",
+# }
+
+# RPT_VALUE_TYPE_MARKERS: Dict[str, str] = {
+#     "meas": "o",  # absolute
+#     "pred": "D",  # absolute
+#     "%pred": "s",  # percentage
+#     "%chg": "^",  # percentage
+#     "raw": "x",
+# }
+
+# DEFAULT_TEST_TYPES = ["PFT", "Bronchodilator", "CO Diffusing"]
+
+# # ----------------------------- Parsers ---------------------------------- #
+
+# _MEASUREINDEX_PAT = re.compile(r"(FEV1/FVC|FEV1|FVC|DLCO/VA|DLCO)", re.IGNORECASE)
+# _RPT_PATTERNS = {
+#     "%pred": re.compile(r"%\s*pred", re.IGNORECASE),
+#     "meas": re.compile(r"\bmeas(?:ured)?\b", re.IGNORECASE),
+#     "pred": re.compile(r"\bpred(?!\s*%)\b", re.IGNORECASE),
+#     "%chg": re.compile(r"%\s*chg", re.IGNORECASE),
+# }
+# _TESTTYPE_PATTERNS: List[Tuple[re.Pattern, str]] = [
+#     (re.compile(r"\bbronchodilator\b", re.IGNORECASE), "Bronchodilator"),
+#     (re.compile(r"\bPFT\b", re.IGNORECASE), "PFT"),
+#     (re.compile(r"\bCO\s*Diffusing\b|\bDLCO\b", re.IGNORECASE), "CO Diffusing"),
+# ]
 
 
-@app.command()
-def main(
-    # ---- REPLACE DEFAULT PATHS AS APPROPRIATE ----
-    input_path: Path = PROCESSED_DATA_DIR / "dataset.csv",
-    output_path: Path = FIGURES_DIR / "plot.png",
-    # -----------------------------------------
-):
-    # ---- REPLACE THIS WITH YOUR OWN CODE ----
-    logger.info("Generating plot from data...")
-    for i in tqdm(range(10), total=10):
-        if i == 5:
-            logger.info("Something happened for iteration 5.")
-    logger.success("Plot generation complete.")
-    # -----------------------------------------
+# def parse_measure_index(name: str) -> str:
+#     m = _MEASUREINDEX_PAT.search(name or "")
+#     return m.group(1).upper() if m else "OTHER"
+
+
+# def parse_rpt_value_type(name: str) -> str:
+#     text = name or ""
+#     for key, pat in _RPT_PATTERNS.items():
+#         if pat.search(text):
+#             return key
+#     return "raw"
+
+
+# def parse_test_type(name: str) -> str:
+#     text = name or ""
+#     for pat, label in _TESTTYPE_PATTERNS:
+#         if pat.search(text):
+#             return label
+#     return "Other"
+
+
+# # ----------------------------- Pipeline --------------------------------- #
+
+
+# def load_and_prepare(path_csv: Path) -> pd.DataFrame:
+#     """Load merged CSV and add parsed columns; filter to wanted measure indexes."""
+#     df = pd.read_csv(path_csv, encoding="utf-8-sig")
+#     df["Reception Date"] = pd.to_datetime(df["Reception Date"], format="%Y%m%d", errors="coerce")
+#     df["Result Numerical Value"] = pd.to_numeric(df["Result Numerical Value"], errors="coerce")
+#     df["Result item name"] = df["Result item name"].astype("string").fillna("")
+
+#     df["measure_index"] = df["Result item name"].apply(parse_measure_index)
+#     df["rpt_value_type"] = df["Result item name"].apply(parse_rpt_value_type)
+#     df["test_type"] = df["Result item name"].apply(parse_test_type)
+
+#     sub = (
+#         df[df["measure_index"].isin(WANTED_MEASURE_INDEXES)]
+#         .dropna(subset=["Reception Date", "Result Numerical Value"])
+#         .copy()
+#     )
+#     return sub
+
+
+# def plot_patient_context(
+#     dfx: pd.DataFrame,
+#     patient_id: int,
+#     test_type: str,
+#     out_dir: Path,
+#     measure_index_colors: Dict[str, str] = MEASURE_INDEX_COLORS,
+#     rpt_value_type_markers: Dict[str, str] = RPT_VALUE_TYPE_MARKERS,
+# ) -> None:
+#     """Plot one patient × one test_type with twin y-axes and legend below."""
+#     dfx = dfx[(dfx["Patient Number"] == patient_id) & (dfx["test_type"] == test_type)]
+#     if dfx.empty:
+#         return
+
+#     dfx = dfx.sort_values("Reception Date")
+
+#     fig, ax_abs = plt.subplots(figsize=(12, 6))
+#     ax_pct = ax_abs.twinx()  # right axis for percentages
+
+#     handles_abs, handles_pct = [], []
+#     variants_present = sorted(dfx["rpt_value_type"].dropna().unique())
+#     for mi in WANTED_MEASURE_INDEXES:
+#         for rvt in variants_present:
+#             dft = dfx[(dfx["measure_index"] == mi) & (dfx["rpt_value_type"] == rvt)]
+#             if dft.empty:
+#                 continue
+
+#             color = measure_index_colors.get(mi, "black")
+#             marker = rpt_value_type_markers.get(rvt, ".")
+
+#             if rvt in ("meas", "pred"):  # absolute values
+#                 (h,) = ax_abs.plot(
+#                     dft["Reception Date"],
+#                     dft["Result Numerical Value"],
+#                     marker=marker,
+#                     color=color,
+#                     linewidth=1.6,
+#                     label=f"{mi} [{rvt}] (n={len(dft)})",
+#                 )
+#                 handles_abs.append(h)
+#             elif rvt in ("%pred", "%chg"):  # percentages
+#                 (h,) = ax_pct.plot(
+#                     dft["Reception Date"],
+#                     dft["Result Numerical Value"],
+#                     marker=marker,
+#                     color=color,
+#                     linestyle="--",
+#                     linewidth=1.6,
+#                     label=f"{mi} [{rvt}] (n={len(dft)})",
+#                 )
+#                 handles_pct.append(h)
+#             else:  # unknown → put on absolute axis
+#                 (h,) = ax_abs.plot(
+#                     dft["Reception Date"],
+#                     dft["Result Numerical Value"],
+#                     marker=marker,
+#                     color=color,
+#                     linewidth=1.6,
+#                     label=f"{mi} [{rvt}] (n={len(dft)})",
+#                 )
+#                 handles_abs.append(h)
+
+#     ax_abs.set_title(f"Patient {patient_id} — {test_type}: All Variants by measure_index")
+#     ax_abs.set_xlabel("Reception Date")
+#     ax_abs.set_ylabel("Absolute value (meas, pred)")
+#     ax_pct.set_ylabel("Percent (%pred, %chg)")
+#     ax_abs.grid(True, linestyle="--", alpha=0.35)
+#     for t in ax_abs.get_xticklabels():
+#         t.set_rotation(20)
+
+#     y0, y1 = ax_pct.get_ylim()
+#     if y1 < 100:
+#         ax_pct.set_ylim(0, 110)
+#     else:
+#         ax_pct.set_ylim(0, min(140, y1))
+
+#     handles = handles_abs + handles_pct
+#     if handles:
+#         fig.legend(
+#             handles,
+#             [h.get_label() for h in handles],
+#             loc="lower center",
+#             bbox_to_anchor=(0.5, -0.12),
+#             ncol=3,
+#             fontsize=9,
+#             frameon=False,
+#         )
+#         fig.subplots_adjust(bottom=0.22)
+
+#     out_dir.mkdir(parents=True, exist_ok=True)
+#     out_name = f"patient_{patient_id}_{test_type.replace(' ', '_')}_all_variants_twin.png"
+#     fig.savefig(out_dir / out_name, dpi=300, bbox_inches="tight")
+#     plt.close(fig)
+
+
+# def plot_patients(
+#     df: pd.DataFrame,
+#     patient_ids: Iterable[int],
+#     test_types: Iterable[str] = DEFAULT_TEST_TYPES,
+#     out_dir: Path = Path("data/interim/pft_plots_all_variants"),
+#     make_ppt: bool = False,
+# ) -> None:
+#     """Generate all plots (patients × test_types) and a PPT per patient."""
+#     out_dir = Path(out_dir)
+#     for pid in patient_ids:
+#         # 1) Make plots
+#         for tt in test_types:
+#             plot_patient_context(df, pid, tt, out_dir)
+#             # 2) Make PPT for this patient
+#             make_patient_ppt(
+#                 patient_id=pid,
+#                 test_types=test_types,
+#                 plots_dir=out_dir,
+#                 ppt_out_path=out_dir / "ppt" / f"patient_{pid}_pft_summary.pptx",
+#             )
+
+
+# def make_patient_ppt(
+#     patient_id: int,
+#     test_types: Iterable[str],
+#     plots_dir: Path,
+#     ppt_out_path: Path | None = None,
+#     title: str | None = None,
+# ) -> Path:
+#     """
+#     Create a PPTX with all plots for a single patient.
+#     Expects images saved by `plot_patient_context` like:
+#       patient_{id}_{test_type}_all_variants_twin.png
+#     """
+#     plots_dir = Path(plots_dir)
+#     if ppt_out_path is None:
+#         ppt_out_dir = plots_dir / "ppt"
+#         ppt_out_dir.mkdir(parents=True, exist_ok=True)
+#         ppt_out_path = ppt_out_dir / f"patient_{patient_id}_pft_summary.pptx"
+#     else:
+#         Path(ppt_out_path).parent.mkdir(parents=True, exist_ok=True)
+
+#     prs = Presentation()
+#     # Ensure 16:9 (inches)
+#     prs.slide_width = Inches(13.33)
+#     prs.slide_height = Inches(7.5)
+
+#     # Title slide
+#     title_layout = prs.slide_layouts[0]  # Title
+#     slide = prs.slides.add_slide(title_layout)
+#     slide.shapes.title.text = title or f"Patient {patient_id} — Pulmonary Function Summary"
+#     slide.placeholders[1].text = "Generated from merged PFT data (meas/pred/%pred/%chg)"
+
+#     # Add one slide per test type (if image exists)
+#     blank_layout = prs.slide_layouts[6]  # Blank
+#     found_any = False
+#     for tt in test_types:
+#         img_name = f"patient_{patient_id}_{tt.replace(' ', '_')}_all_variants_twin.png"
+#         img_path = plots_dir / img_name
+#         if not img_path.exists():
+#             continue
+
+#         found_any = True
+#         slide = prs.slides.add_slide(blank_layout)
+
+#         # Optional slide title (simple text box)
+#         left = Inches(0.5)
+#         top = Inches(0.3)
+#         width = Inches(12.33)
+#         height = Inches(0.6)
+#         title_box = slide.shapes.add_textbox(left, top, width, height)
+#         p = title_box.text_frame.paragraphs[0]
+#         p.text = f"{tt}: All Variants by measure_index"
+#         p.font.size = Pt(24)
+
+#         # Place the image centered below title
+#         img_top = Inches(1.1)
+#         img_left = Inches(0.5)
+#         img_width = Inches(12.33)
+#         img_height = Inches(6)
+#         slide.shapes.add_picture(
+#             str(img_path), img_left, img_top, height=img_height
+#         )  # width=img_width
+
+#     if not found_any:
+#         # Still save a minimal deck to signal “no plots”
+#         note_slide = prs.slides.add_slide(blank_layout)
+#         tb = note_slide.shapes.add_textbox(Inches(1), Inches(2.5), Inches(10), Inches(1))
+#         tb.text_frame.text = f"No plots found for patient {patient_id} in {plots_dir}"
+
+#     prs.save(ppt_out_path)
+#     return ppt_out_path
+
+
+# def main():
+#     data_path = Path("data/processed/pft_merged.csv")
+#     out_dir = Path("data/interim/pft_plots_all_variants")
+
+#     df = load_and_prepare(data_path)
+#     # patient_ids = [886482, 1207865, 1452945, 611957, 965594]
+#     patient_ids = patient_ids = patient_ids = df["Patient Number"].dropna().astype(int).unique()
+#     print("Total patients:", len(patient_ids))
+#     plot_patients(df, patient_ids, DEFAULT_TEST_TYPES, out_dir, make_ppt=True)
+
+
+# new
+# MEASURE_INDEX_COLORS: Dict[str, str] = {
+#     "FEV1": "tab:blue",
+#     "FVC": "tab:orange",
+#     "FEV1/FVC": "tab:green",
+#     "DLCO": "tab:red",
+#     "DLCO/VA": "tab:purple",
+# }
+
+# def plot_patient_context(
+#     dfx: pd.DataFrame,
+#     test_type: str,
+#     out_dir: Path,
+#     plot_variable_order: list[str] = None,
+#     measure_index_colors: Dict[str, str] = MEASURE_INDEX_COLORS,
+# ) -> None:
+#     """
+#     Plot one patient × one test_type with twin y-axes and legend below.
+#     Organized by 'Variable' column in a fixed order.
+#     """
+#     # dfx = dfx[(dfx["Patient Number"] == patient_id) & (dfx["test_type"] == test_type)]
+#     if dfx.empty:
+#         return
+
+#     dfx = dfx.sort_values("Reception Date")
+
+#     if plot_variable_order is None:
+#         plot_variable_order = ["Meas", "Pred", "%Pred", "%Chg.", "Post_Meas", "Post_%Pred", "Post_%Chg"]
+
+#     fig, ax_abs = plt.subplots(figsize=(12, 6))
+#     ax_pct = ax_abs.twinx()  # right axis for % variables
+
+#     handles_abs, handles_pct = [], []
+
+#     # loop by measure index and then by variable in specified order
+#     for v in plot_variable_order:
+#         for var in plot_variable_order:
+#             dft = dfx[(dfx["measure_index"] == mi) & (dfx["Variable"] == var)]
+#             if dft.empty:
+#                 continue
+
+#             color = measure_index_colors.get(mi, "black")
+
+#             if var.lower() in ("meas", "pred", "post_meas", "post_pred"):  # absolute values
+#                 h, = ax_abs.plot(
+#                     dft["Reception Date"],
+#                     dft["Result Numerical Value"],
+#                     marker="o", color=color, linewidth=1.6,
+#                     label=f"{mi} [{var}] (n={len(dft)})"
+#                 )
+#                 handles_abs.append(h)
+#             elif "%pred" in var.lower() or "%chg" in var.lower():  # percentages
+#                 h, = ax_pct.plot(
+#                     dft["Reception Date"],
+#                     dft["Result Numerical Value"],
+#                     marker="s", color=color, linestyle="--", linewidth=1.6,
+#                     label=f"{mi} [{var}] (n={len(dft)})"
+#                 )
+#                 handles_pct.append(h)
+#             else:  # fallback → absolute axis
+#                 h, = ax_abs.plot(
+#                     dft["Reception Date"],
+#                     dft["Result Numerical Value"],
+#                     marker=".", color=color, linewidth=1.6,
+#                     label=f"{mi} [{var}] (n={len(dft)})"
+#                 )
+#                 handles_abs.append(h)
+
+#     ax_abs.set_title(f"Patient {patient_id} — {test_type}: All Variants by measure_index")
+#     ax_abs.set_xlabel("Reception Date")
+#     ax_abs.set_ylabel("Absolute values (Meas, Pred, Post_)")
+#     ax_pct.set_ylabel("Percent (%Pred, %Chg)")
+#     ax_abs.grid(True, linestyle="--", alpha=0.35)
+#     for t in ax_abs.get_xticklabels():
+#         t.set_rotation(20)
+
+#     # fix y limits for percentages
+#     y0, y1 = ax_pct.get_ylim()
+#     if y1 < 100:
+#         ax_pct.set_ylim(0, 110)
+#     else:
+#         ax_pct.set_ylim(0, min(140, y1))
+
+#     # legend
+#     handles = handles_abs + handles_pct
+#     if handles:
+#         fig.legend(
+#             handles,
+#             [h.get_label() for h in handles],
+#             loc="lower center",
+#             bbox_to_anchor=(0.5, -0.12),
+#             ncol=3,
+#             fontsize=9,
+#             frameon=False,
+#         )
+#         fig.subplots_adjust(bottom=0.22)
+
+#     out_dir.mkdir(parents=True, exist_ok=True)
+#     out_name = f"patient_{patient_id}_{test_type.replace(' ', '_')}_by_variable.png"
+#     fig.savefig(out_dir / out_name, dpi=300, bbox_inches="tight")
+#     plt.close(fig)
+
+# def plot_patient_variables_grid(
+#     dfx: pd.DataFrame,
+#     patient_id: int,
+#     out_dir: Path = Path(FIGURES_DIR / "pft_plots_all_variants"),
+#     plot_variable_order: List[str] = None,
+#     wanted_measure_indexes: List[str] = None,
+#     measure_index_colors: Dict[str, str] = None,
+#     marker: str = "o",
+#     linewidth: float = 1.6,
+# ) -> None:
+#     """
+#     One figure with seven vertical subplots, one per Variable.
+#     Each subplot shows all selected Measurements over time.
+#     Each subplot has its own x-label and title.
+#     """
+#     print(f"{dfx.shape=}")
+#     if dfx.empty:
+#         return
+
+#     dfx = dfx.copy().sort_values("Prescription Date")
+
+#     if plot_variable_order is None:
+#         plot_variable_order = ["Meas","Pred","%Pred","%Chg.","Post_Meas","Post_%Pred","Post_%Chg"]
+#     if wanted_measure_indexes is None:
+#         wanted_measure_indexes = sorted(dfx["Measurement"].dropna().unique().tolist())
+#     if measure_index_colors is None:
+#         import itertools
+#         base = ["C0","C1","C2","C3","C4","C5","C6","C7","C8","C9"]
+#         measure_index_colors = {mi: c for mi, c in zip(wanted_measure_indexes, itertools.cycle(base))}
+
+#     nrows = len(plot_variable_order)
+#     fig, axes = plt.subplots(nrows=nrows, ncols=1, figsize=(14, 18), sharex=True)
+#     if nrows == 1:
+#         axes = [axes]
+
+#     handles_all, labels_all = [], []
+
+#     for ax, var in zip(axes, plot_variable_order):
+#         dft_var = dfx[dfx["Variable"] == var]
+#         ax.set_title(f"Variable: {var}", fontsize=12)
+#         ax.set_xlabel("Prescription Date")
+#         ax.set_ylabel("Value")
+#         ax.grid(True, linestyle="--", alpha=0.3)
+
+#         any_line = False
+#         for mi in wanted_measure_indexes:
+#             dft = dft_var[dft_var["Measurement"] == mi]
+#             if dft.empty:
+#                 continue
+
+#             h, = ax.plot(
+#                 dft["Prescription Date"],
+#                 dft["Result Numerical Value"],
+#                 marker=marker,
+#                 linewidth=linewidth,
+#                 color=measure_index_colors.get(mi, "black"),
+#                 label=mi,
+#             )
+#             any_line = True
+
+#             if not any(lbl.get_label() == mi for lbl in handles_all):
+#                 handles_all.append(h)
+#                 labels_all.append(mi)
+
+#         if not any_line:
+#             ax.text(0.5, 0.5, "No data", ha="center", va="center",
+#                     transform=ax.transAxes, alpha=0.6)
+
+#     fig.suptitle(f"Patient {patient_id} — All Variables", y=0.995, fontsize=14)
+
+#     if handles_all:
+#         fig.legend(
+#             handles_all, labels_all,
+#             loc="lower center", bbox_to_anchor=(0.5, 0.0),
+#             ncol=min(5, len(labels_all)), fontsize=10, frameon=False
+#         )
+#         fig.subplots_adjust(bottom=0.08, top=0.95, hspace=0.4)
+#     else:
+#         fig.subplots_adjust(top=0.95, hspace=0.4)
+
+#     out_dir = Path(out_dir)
+#     out_dir.mkdir(parents=True, exist_ok=True)
+#     out_name = f"patient_{patient_id}_variables_grid.png"
+#     fig.savefig(out_dir / out_name, dpi=300, bbox_inches="tight")
+#     plt.close(fig)
+
+
+def plot_patient_variables_grid(
+    dfx: pd.DataFrame,
+    patient_id: int,
+    out_dir: Path = Path(FIGURES_DIR / "pft_plots_all_variants"),
+    plot_variable_order: List[str] = None,
+    wanted_measure_indexes: List[str] = None,
+    measure_index_colors: Dict[str, str] = None,
+    marker: str = "o",
+    linewidth: float = 1.6,
+    plot_anomaly: bool = True,
+    *,
+    title_suffix: str = "",
+) -> None:
+    """
+    Create one figure with vertical subplots (one per Variable).
+    - Plots selected Measurements over time (per subplot).
+    - Uses full YYYY-MM-DD dates on x-axis; only bottom subplot has x-label.
+    - Overlays anomaly markers as hollow squares (no text labels).
+    - Adds measurement legend (single row) and stacked anomaly legend lines.
+
+    Expects anomaly columns if available:
+      'Anomaly_Missing', 'Anomaly_Range', 'Outlier_MAD', 'Outlier_Jump'
+    The plot renders fine even if they are absent.
+    """
+    import itertools
+    import matplotlib.dates as mdates
+    from matplotlib.lines import Line2D
+
+    if dfx.empty:
+        return
+
+    # ---- constants / basic prep ----
+    DATE_COL  = "Prescription Date"
+    VALUE_COL = "Result Numerical Value"
+    VAR_COL   = "Variable"
+    MEAS_COL  = "Measurement"
+
+    dfx = dfx.copy()
+    dfx[DATE_COL] = pd.to_datetime(dfx[DATE_COL], errors="coerce")
+    dfx = dfx.sort_values(DATE_COL)
+
+    if plot_variable_order is None:
+        plot_variable_order = ["Meas", "%Pred", "%Chg.", "Post_Meas", "Post_%Pred", "Post_%Chg"]
+    if wanted_measure_indexes is None:
+        wanted_measure_indexes = sorted(dfx[MEAS_COL].dropna().unique().tolist())
+    if measure_index_colors is None:
+        base = ["C0","C1","C2","C3","C4","C5","C6","C7","C8","C9"]
+        measure_index_colors = {mi: c for mi, c in zip(wanted_measure_indexes, itertools.cycle(base))}
+
+    # anomaly colors (distinct from typical Matplotlib defaults)
+    ANOM_COLORS = {
+        "Missing": "#FFB300",  # amber
+        "Range":   "#8B0000",  # dark red
+        "MAD":     "#000000",  # black
+        "Jump":    "#00BFA6",  # teal
+    }
+    have_anom_cols = all(
+        col in dfx.columns
+        for col in ["Anomaly_Missing", "Anomaly_Range", "Outlier_MAD", "Outlier_Jump"]
+    )
+
+    # ---- figure & axes ----
+    nrows = len(plot_variable_order)
+    fig, axes = plt.subplots(nrows=nrows, ncols=1, figsize=((16*2.3*nrows) / 9, 2.3*nrows), sharex=False)
+    if nrows == 1:
+        axes = [axes]
+
+    handles_all, labels_all = [], []
+
+    # ---- plotting per variable ----
+    for ax, var in zip(axes, plot_variable_order):
+        dft_var = dfx[dfx[VAR_COL] == var]
+        ax.set_ylabel(var)
+        ax.grid(True, linestyle="--", alpha=0.3)
+
+        any_line = False
+        for mi in wanted_measure_indexes:
+            dft = dft_var[dft_var[MEAS_COL] == mi]
+            if dft.empty:
+                continue
+
+            # measurement series (circles)
+            h, = ax.plot(
+                dft[DATE_COL],
+                dft[VALUE_COL],
+                marker=marker, linewidth=linewidth,
+                color=measure_index_colors.get(mi, "black"),
+                label=mi, zorder=2,
+            )
+            any_line = True
+            if not any(lbl.get_label() == mi for lbl in handles_all):
+                handles_all.append(h)
+                labels_all.append(mi)
+
+            # anomaly overlays (squares) — only if anomaly cols exist
+            if plot_anomaly and have_anom_cols:
+                anom_specs = [
+                    ("MAD",     "Outlier_MAD"),
+                    ("Jump",    "Outlier_Jump"),
+                    ("Range",   "Anomaly_Range"),
+                    ("Missing", "Anomaly_Missing"),
+                ]
+                for key, col in anom_specs:
+                    if col in dft.columns and dft[col].any():
+                        bad = dft[dft[col]]
+                        ax.scatter(
+                            bad[DATE_COL], bad[VALUE_COL],
+                            s=80, marker="s",
+                            facecolors="none", edgecolors=ANOM_COLORS[key],
+                            linewidths=1.8, zorder=4
+                        )
+
+        if not any_line:
+            ax.text(0.5, 0.5, "No data", ha="center", va="center",
+                    transform=ax.transAxes, alpha=0.6)
+
+        # x-axis as full date per subplot
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
+        ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+        for tick in ax.get_xticklabels():
+            tick.set_rotation(30)
+            tick.set_ha("right")
+
+    # x-label only on bottom subplot
+    axes[-1].set_xlabel("Prescription Date")
+
+    # title (with optional suffix)
+    fig.suptitle(
+        f"Patient {patient_id} — All Variables{(' — ' + title_suffix) if title_suffix else ''}",
+        y=0.995, fontsize=14
+    )
+
+    # -------- LEGENDS (measurement row, then one anomaly per line) --------
+    # 1) Measurement legend: single row
+    if handles_all:
+        fig.legend(
+            handles_all, labels_all,
+            loc="lower center", bbox_to_anchor=(0.5, 0.08),
+            ncol=len(labels_all), fontsize=9, frameon=False,
+            handlelength=2.0, handletextpad=0.6, columnspacing=1.2
+        )
+
+    # 2) One line per anomaly (stacked)
+    anom_specs = [
+        ("Missing Value: Value is zero.", ANOM_COLORS["Missing"]),
+        ("Out of Valid Range: FEV1 & FVC (Meas/Post_Meas) 0.2-10.0; DLCO 0.3-50; FEV1/FVC 0.2-1.2; %Pred 0-200.", ANOM_COLORS["Range"]),
+        ("MAD: |robust_z| > z_thresh (3.5)", ANOM_COLORS["MAD"]),
+        ("Jump: Δ/month > thresholds (FEV1 0.30, FVC 0.40, DLCO 3.0, FEV1/FVC 0.08, DLCO/VA 0.60).", ANOM_COLORS["Jump"]),
+    ]
+    y0, dy = 0.07, 0.01   # starting y and spacing between lines
+    for i, (lab, col) in enumerate(anom_specs):
+        h = Line2D([0],[0], marker='s', linestyle='None', markersize=8,
+                   markerfacecolor='none', markeredgecolor=col, label=lab)
+        fig.legend(
+            [h], [lab],
+            loc="lower center", bbox_to_anchor=(0.5, y0 - i*dy),
+            ncol=1, fontsize=9, frameon=False, handlelength=1.2
+        )
+
+    # room for 1 (measurements) + 4 (anomalies) lines
+    fig.subplots_adjust(bottom=0.16, top=0.95, hspace=0.5)
+
+    # ---- save ----
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_name = f"patient_{patient_id}_variables_grid.png"
+    fig.savefig(out_dir / out_name, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+matplotlib.use("Agg")  # headless, safe in child processes
+
+def _plot_one(args):
+    pid, dfx = args
+
+    # Prevent thread over-subscription inside each process
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+
+    # plot_patient_variables_grid(dfx, pid)
+    dfx_flagged, title_tag = dataset.detect_anomalies(dfx)            # ← one function
+    plot_patient_variables_grid(dfx_flagged, pid, title_suffix=title_tag)
+    return pid
+
+def plot_all_patients_in_parallel():
+    df = pd.read_csv(Path(INTERIM_DATA_DIR / "ALL_PRESCRIPTION_DATA_TMV.csv"))
+    df["Prescription Date"] = pd.to_datetime(df["Prescription Date"], format="%Y%m%d", errors="coerce")
+    df["Result Numerical Value"] = pd.to_numeric(df["Result Numerical Value"], errors="coerce")
+
+
+    want = [886482, 1207865, 1452945, 611957, 965594, 5665, 7429, 29903]
+    # want = df["Patient Number"].unique().tolist()  # all patients
+    tasks = [(pid, g.copy()) for pid, g in df.groupby("Patient Number") if pid in want and not g.empty]
+
+    max_workers = max(1, min(48, (os.cpu_count() or 8) - 2))
+    with ProcessPoolExecutor(max_workers=max_workers) as ex:
+        futures = [ex.submit(_plot_one, t) for t in tasks]
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="Plotting patients"):
+            pid_done = fut.result()   # raises if error inside worker
+            # logger.info(f"✓ plotted patient {pid_done}")
+
+    # with ProcessPoolExecutor(max_workers=max_workers) as ex:
+    #     futures = [ex.submit(_plot_one, t) for t in tasks]
+    #     for fut in as_completed(futures):
+    #         logger.info(f"✓ plotted patient {fut.result()}")
+
+
+
 
 
 if __name__ == "__main__":
-    app()
+    df = pd.read_csv(Path(r"D:\Research\Project_COPD\COPD\data\interim\ALL_PRESCRIPTION_DATA_FILTERED.csv"))
+    df["Prescription Date"] = pd.to_datetime(df["Prescription Date"], format="%Y%m%d", errors="coerce")
+    df["Result Numerical Value"] = pd.to_numeric(df["Result Numerical Value"], errors="coerce")
+    patient_ids = [886482, 1207865, 1452945, 611957, 965594]
+    for pid in patient_ids:
+        dfx = df[(df["Patient Number"] == pid)]
+        plot_patient_variables_grid(dfx, pid)
