@@ -47,7 +47,6 @@ from typing import Dict, Any, Tuple
 import pandas as pd
 import numpy as np
 
-
 def summarize_pft_df(df: pd.DataFrame, show_values: bool = True) -> Dict[str, Any]:
     """
     Prints and returns:
@@ -79,11 +78,23 @@ def summarize_pft_df(df: pd.DataFrame, show_values: bool = True) -> Dict[str, An
     mt_base['Measurement'] = mt_base['Measurement'].astype(str).str.strip()
     mt_base['Test'] = mt_base['Test'].astype(str).str.strip()
 
-    combo_counts = (mt_base
+    combo_counts_mt = (mt_base
                     .value_counts(['Measurement', 'Test'])
                     .reset_index(name='count')
                     .sort_values(['Measurement', 'Test'])
                     .reset_index(drop=True))
+    
+    # ---- (Measurement, Test) value counts (cleaned) ----
+    mt_base = df.loc[df['Measurement'].notna() & df['Variable'].notna(), ['Measurement', 'Variable']].copy()
+    mt_base['Measurement'] = mt_base['Measurement'].astype(str).str.strip()
+    mt_base['Variable'] = mt_base['Variable'].astype(str).str.strip()
+
+    combo_counts_mv = (mt_base
+                    .value_counts(['Measurement', 'Variable'])
+                    .reset_index(name='count')
+                    .sort_values(['Measurement', 'Variable'])
+                    .reset_index(drop=True))
+
 
     result = {
         'total_unique_patients': int(len(patients)),
@@ -97,9 +108,12 @@ def summarize_pft_df(df: pd.DataFrame, show_values: bool = True) -> Dict[str, An
         'total_unique_variables': len(vars_u),
         'unique_variables': vars_u,
 
+        # based on the rows in combo_counts_mt
+        'total_unique_(measurement,test)_combinations': int(combo_counts_mt.shape[0]),
+        'combo_counts_df': combo_counts_mv,  # DataFrame with Measurement, Test, count
         # based on the rows in combo_counts
-        'total_unique_(measurement,test)_combinations': int(combo_counts.shape[0]),
-        'combo_counts_df': combo_counts,  # DataFrame with Measurement, Test, count
+        'total_unique_(measurement,variable)_combinations': int(combo_counts_mv.shape[0]),
+        'combo_counts_df': combo_counts_mv,  # DataFrame with Measurement, Test, count
     }
 
     # ---- Print nicely ----
@@ -121,10 +135,142 @@ def summarize_pft_df(df: pd.DataFrame, show_values: bool = True) -> Dict[str, An
 
     return result
 
+# def detect_anomalies(dfx: pd.DataFrame,
+#                      date_col: str = "Prescription Date",
+#                      value_col: str = "Result Numerical Value",
+#                      measure_col: str = "Measurement",
+#                      variable_col: str = "Variable",
+#                      z_thresh: float = 3.5,
+#                      jump_thresh_per_month: Dict[str, float] | None = None
+#                     ) -> Tuple[pd.DataFrame, str]:
+#     """
+#     Returns:
+#       flagged_df (same rows as dfx, with anomaly columns)
+#       title_tag  (e.g., 'Missing value+Out of valid range+MAD+Jump' for this patient)
+
+#     Flags:
+#       - Anomaly_Missing: value == 0 or NaN
+#       - Anomaly_Range: outside clinical ranges
+#           FEV1 (Meas/Post_Meas): 0.2–10.0
+#           FVC  (Meas/Post_Meas): 0.3–10.0
+#           DLCO (Meas/Post_Meas): 0.3–50
+#           FEV1/FVC ratio (Meas/Post_Meas): 0.2–1.2
+#           %Pred ( %Pred/Post_%Pred ): 0–200
+#       - Outlier_MAD: |robust_z| > z_thresh (per-measurement series)
+#       - Outlier_Jump: month-normalized step exceeds measurement threshold
+#     """
+#     jump_thresh_per_month = jump_thresh_per_month or {
+#         "FEV1": 0.30, "FVC": 0.40, "DLCO": 3.0, "FEV1/FVC": 0.08, "DLCO/VA": 0.60,
+#     }
+#     abs_vars   = {"Meas", "Post_Meas"}
+#     perc_vars  = {"%Pred", "Post_%Pred"}
+
+#     df2 = dfx.copy()
+
+#     # Ensure numeric + datetime for calculations
+#     v = pd.to_numeric(df2[value_col], errors="coerce")
+#     dt = pd.to_datetime(df2[date_col], errors="coerce")
+#     df2["_val_"] = v
+#     df2["_date_"] = dt
+
+#     # 1) Missing (as requested: treat 0 as missing; also NaN is missing)
+#     df2["Anomaly_Missing"] = v.isna() | (v == 0)
+
+#     # 2) Valid ranges
+#     rng_flag = pd.Series(False, index=df2.index)
+
+#     def _violate(series_mask, low, high):
+#         if not series_mask.any(): 
+#             return pd.Series(False, index=df2.index)
+#         s = v.where(series_mask)
+#         return (s < low) | (s > high)
+
+#     # Absolute measurements (Meas/Post_Meas)
+#     m = df2[measure_col].astype(str)
+#     var = df2[variable_col].astype(str)
+
+#     mask_abs = var.isin(abs_vars)
+#     #!  rng_flag mark all measurements not the one violated the value
+#     rng_flag |= _violate(mask_abs & (m == "FEV1"), 0.2, 10.0)
+#     rng_flag |= _violate(mask_abs & (m == "FVC"),  0.3, 10.0)
+#     rng_flag |= _violate(mask_abs & (m == "DLCO"), 0.3, 50.0)
+
+#     # Ratio FEV1/FVC (absolute)
+#     rng_flag |= _violate(mask_abs & (m == "FEV1/FVC"), 0.2, 1.2)
+
+#     # Percent predicted
+#     mask_perc = var.isin(perc_vars)
+#     rng_flag |= _violate(mask_perc, 0.0, 200.0)
+
+#     df2["Anomaly_Range"] = rng_flag.fillna(False)
+
+#     # 3) Outliers (MAD + Jump) per measurement series
+#     out_mad  = pd.Series(False, index=df2.index)
+#     out_jump = pd.Series(False, index=df2.index)
+
+#     #!  For a measurement currently considering all variables; we need for each variable
+
+#     for mi, g in df2.groupby([measure_col, variable_col], dropna=False): #df2.groupby(measure_col, dropna=False):
+#         g = g[g["Anomaly_Missing"]==False]
+#         g = g.sort_values("_date_")
+#         vv = g["_val_"]
+#         dd = g["_date_"]
+
+#         # MAD
+#         med = vv.median()
+#         mad = float(np.median(np.abs(vv - med))) if len(vv) else 0.0
+#         mad = mad if mad > 0 else 1e-9
+#         robust_z = 0.6745 * (vv - med) / mad
+#         out_mad.loc[g.index] = robust_z.abs() > z_thresh
+
+#         # Jump per month
+#         dv = vv.diff().abs()
+#         dt_days = dd.diff().dt.days
+#         dt_days = dt_days.where(dt_days > 0, 1)  # avoid 0/NaN/<=0
+#         months = dt_days / 30.0
+#         # months = months.where(dt_days >= 14, 1.0) # ignore jumps if dt_days < 14
+#         thr = jump_thresh_per_month.get(str(mi[0]), np.inf) #jump_thresh_per_month.get(str(mi), np.inf)
+#         out_jump.loc[g.index] = (dv / months) > thr
+
+#     df2["Outlier_MAD"]  = out_mad.fillna(False)
+#     df2["Outlier_Jump"] = out_jump.fillna(False)
+#     df2["Outlier"]      = df2["Outlier_MAD"] | df2["Outlier_Jump"]
+
+#     # Compose row-wise tags
+#     def _row_tags(row):
+#         tags = []
+#         if row["Anomaly_Missing"]: tags.append("Missing value")
+#         if row["Anomaly_Range"]:   tags.append("Out of valid range")
+#         if row["Outlier_MAD"]:     tags.append("MAD")
+#         if row["Outlier_Jump"]:    tags.append("Jump")
+#         return " | ".join(tags)
+
+#     df2["Anomaly_Tags"] = df2.apply(_row_tags, axis=1)
+#     # Short tag for tight annotations
+#     df2["Anomaly_Tags_Short"] = (df2["Anomaly_Tags"]
+#                                  .str.replace("Missing value", "Miss", regex=False)
+#                                  .str.replace("Out of valid range", "Range", regex=False))
+
+#     df2["Anomaly_Any"] = df2[["Anomaly_Missing","Anomaly_Range","Outlier_MAD","Outlier_Jump"]].any(axis=1)
+
+#     # Build patient-level title tag
+#     present = []
+#     anomaly_flag = df2["Anomaly_Any"].any()
+#     if df2["Anomaly_Missing"].any(): present.append("Missing value")
+#     if df2["Anomaly_Range"].any():   present.append("Out of valid range")
+#     if df2["Outlier_MAD"].any():     present.append("MAD")
+#     if df2["Outlier_Jump"].any():    present.append("Jump")
+#     title_tag = "+".join(present)
+
+#     # Clean temp cols for plotting (keep dates numeric as original)
+#     df2 = df2.drop(columns=["_val_", "_date_"])
+
+#     return df2, title_tag, anomaly_flag
 
 def detect_anomalies(dfx: pd.DataFrame,
                      date_col: str = "Prescription Date",
                      value_col: str = "Result Numerical Value",
+                     test_col: str = "Test",
                      measure_col: str = "Measurement",
                      variable_col: str = "Variable",
                      z_thresh: float = 3.5,
@@ -146,9 +292,11 @@ def detect_anomalies(dfx: pd.DataFrame,
       - Outlier_MAD: |robust_z| > z_thresh (per-measurement series)
       - Outlier_Jump: month-normalized step exceeds measurement threshold
     """
-    jump_thresh_per_month = jump_thresh_per_month or {
-        "FEV1": 0.30, "FVC": 0.40, "DLCO": 3.0, "FEV1/FVC": 0.08, "DLCO/VA": 0.60,
-    }
+    # jump_thresh_per_month = jump_thresh_per_month or {"FEV1": 0.30, "FVC": 0.40, "DLCO": 3.0, "FEV1/FVC": 0.08, "DLCO/VA": 0.60}
+    # jump_thresh_per_month = jump_thresh_per_month or {"FEV1": 0.30, "FVC": 0.40, "DLCO": 3.0, "FEV1/FVC": 8.0, "DLCO/VA": 0.60}
+    jump_thresh_per_month = {"Meas":{"FEV1": 0.30, "FVC": 0.40, "DLCO": 3.0, "FEV1/FVC": 8.0, "DLCO/VA": 0.60},
+                         "%Pred": {"FEV1": 8.0, "FVC": 8.0, "DLCO": 8.0, "FEV1/FVC": 8.0, "DLCO/VA": 8.0},
+                         "%Chg.": {"FEV1": 7.0, "FVC": 4.0, "DLCO": 0.3, "FEV1/FVC": 4.0, "DLCO/VA": 0.60}}
     abs_vars   = {"Meas", "Post_Meas"}
     perc_vars  = {"%Pred", "Post_%Pred"}
 
@@ -177,12 +325,13 @@ def detect_anomalies(dfx: pd.DataFrame,
     var = df2[variable_col].astype(str)
 
     mask_abs = var.isin(abs_vars)
+    #!  rng_flag mark all measurements not the one violated the value
     rng_flag |= _violate(mask_abs & (m == "FEV1"), 0.2, 10.0)
     rng_flag |= _violate(mask_abs & (m == "FVC"),  0.3, 10.0)
     rng_flag |= _violate(mask_abs & (m == "DLCO"), 0.3, 50.0)
 
     # Ratio FEV1/FVC (absolute)
-    rng_flag |= _violate(mask_abs & (m == "FEV1/FVC"), 0.2, 1.2)
+    rng_flag |= _violate(mask_abs & (m == "FEV1/FVC"), 20, 120)
 
     # Percent predicted
     mask_perc = var.isin(perc_vars)
@@ -194,7 +343,10 @@ def detect_anomalies(dfx: pd.DataFrame,
     out_mad  = pd.Series(False, index=df2.index)
     out_jump = pd.Series(False, index=df2.index)
 
-    for mi, g in df2.groupby(measure_col, dropna=False):
+    #!  For a measurement currently considering all variables; we need for each variable
+
+    for tmv, g in df2.groupby([test_col, measure_col, variable_col], dropna=False): #df2.groupby(measure_col, dropna=False):
+        g = g[g["Anomaly_Missing"]==False]
         g = g.sort_values("_date_")
         vv = g["_val_"]
         dd = g["_date_"]
@@ -211,7 +363,9 @@ def detect_anomalies(dfx: pd.DataFrame,
         dt_days = dd.diff().dt.days
         dt_days = dt_days.where(dt_days > 0, 1)  # avoid 0/NaN/<=0
         months = dt_days / 30.0
-        thr = jump_thresh_per_month.get(str(mi), np.inf)
+        # months = months.where(dt_days >= 14, 1.0) # ignore jumps if dt_days < 14
+        thr = jump_thresh_per_month.get(tmv[2], {}).get(tmv[1], np.inf)
+        # thr = jump_thresh_per_month.get(str(tmv[1]), np.inf) #jump_thresh_per_month.get(str(mi), np.inf)
         out_jump.loc[g.index] = (dv / months) > thr
 
     df2["Outlier_MAD"]  = out_mad.fillna(False)
@@ -237,6 +391,7 @@ def detect_anomalies(dfx: pd.DataFrame,
 
     # Build patient-level title tag
     present = []
+    anomaly_flag = df2["Anomaly_Any"].any()
     if df2["Anomaly_Missing"].any(): present.append("Missing value")
     if df2["Anomaly_Range"].any():   present.append("Out of valid range")
     if df2["Outlier_MAD"].any():     present.append("MAD")
@@ -246,7 +401,7 @@ def detect_anomalies(dfx: pd.DataFrame,
     # Clean temp cols for plotting (keep dates numeric as original)
     df2 = df2.drop(columns=["_val_", "_date_"])
 
-    return df2, title_tag
+    return df2, title_tag, anomaly_flag
 
 
 
@@ -525,9 +680,9 @@ def extract_test_measurement_variable(
         print(f"Parquet version saved to: {pq_path.resolve()}")
 
     return df
+   
 
 
-    
 
 def filter_relevant_measurements(
     df_path: str | Path = INTERIM_DATA_DIR / "ALL_PRESCRIPTION_DATA_TMV.csv",
@@ -544,17 +699,31 @@ def filter_relevant_measurements(
     match="contains"  -> substring match (uses .str.contains)
     """
     df_path = Path(df_path)
-    output_path = Path(output_path)
+    output_path = Path(output_path)    
 
     if desired_items is None:
         desired_items = ["FVC", "FEV1", "DLCO", "FEV1/FVC"]  # sensible default
 
     # read as text to avoid dtype warnings / keep leading zeros
-    df = pd.read_csv(df_path, dtype=str, encoding="utf-8-sig", low_memory=False)
+    df_org = pd.read_csv(df_path, dtype=str, encoding="utf-8-sig", low_memory=False)
+    df= df_org.copy()
 
-    logger.info(f"Desired items: {desired_items}")
     logger.info(f"Unique patients before filtering: {df['Patient Number'].nunique()}")
 
+    # Filter patients with at least 3 years between first and last prescription date
+    patient_groups = df.groupby('Patient Number')
+    def has_min_3_years(g):
+        dates = pd.to_datetime(g["Prescription Date"], errors="coerce")
+        if dates.isnull().all():
+            return False
+        return (dates.max() - dates.min()).days >= 3 * 365
+    patients_3yr = [pid for pid, g in patient_groups if has_min_3_years(g)]
+    df = df[df['Patient Number'].isin(patients_3yr)]
+
+    logger.info(f"Unique patients after filtering patients < 3 years: {df['Patient Number'].nunique()}")    
+
+    # Filter patients with desired measurements
+    logger.info(f"Desired items: {desired_items}")
     # build mask
     if match == "exact":
         mask = df["Measurement"].isin(desired_items)
@@ -564,23 +733,43 @@ def filter_relevant_measurements(
     else:
         raise ValueError("match must be 'exact' or 'contains'")
 
-    df_filtered = df[mask].copy()
+    # df_filtered = df[mask].copy()
+    df = df[mask]
 
-    logger.info(f"Unique patients after filtering: {df_filtered['Patient Number'].nunique()}")
+    # Filter by Tests
+    df = df.rename(columns={"Test": "Temp_Test"})
+    def map_test(val):
+        if "CO Diffusing" in val:
+            return "COD"
+        elif "Bronchodilator" in val:
+            return "BD"
+        elif "PFT" in val:
+            return "PFT"
+        else:
+            return None
+        
+    df["Test"] = df["Temp_Test"].apply(map_test)
+    df = df.drop(columns=["Temp_Test"])
+    if df["Test"].isna().any():
+        logger.warning("Some Temp_Test values could not be mapped to Test.")
 
-    log_uniques("Measurement after filtering", df_filtered['Measurement'].dropna().unique().tolist())
+    logger.info(f'Unique Tests: {df["Test"].unique()} ({df["Test"].nunique()})')    
+
+    log_uniques("Measurement after filtering", df['Measurement'].dropna().unique().tolist())
+
+    logger.info(f"Unique patients after filtering desired measurements: {df['Patient Number'].nunique()}")
     
 
     # save filtered
-    df_filtered.to_csv(output_path, index=False, encoding="utf-8-sig")
+    df.to_csv(output_path, index=False, encoding="utf-8-sig")
     logger.success(f"Saved filtered CSV to: {output_path.resolve()}")
 
     if save_parquet:
         pq_path = output_path.with_suffix(".parquet")
-        df_filtered.to_parquet(pq_path, index=False)
+        df.to_parquet(pq_path, index=False)
         logger.success(f"Saved Parquet to: {pq_path.resolve()}")
 
-    return df_filtered
+    return df
 
     # item_list = df['Result item name'].unique()
     # desired_items = ["FVC", "FEV1", "DLCO"]
