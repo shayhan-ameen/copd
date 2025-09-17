@@ -1,0 +1,5 @@
+Patient Number,Gender,Date of Birth,Visit Type,Treatment Date,Prescription Code,Prescription Name,Prescription Date,Implementation Date,Result item name,Result Numerical Value,Result Value,Laboratory,Implementation laboratory,Region,Pacs Number,Variable,Measurement,Test
+6915443,,,,,OPE7123G,Bronchodilator Test,20181109,,Bronchodilator FEV1 %Pred,-70.48,-70.48,PU01,-,            ,2018110946008.0,%Pred,FEV1,Post_BD
+6915443,,,,,OPE7123G,Bronchodilator Test,20181109,,Bronchodilator FVC %Pred,-85.43,-85.43,PU01,-,            ,2018110946008.0,%Pred,FVC,Post_BD
+6915443,,,,,OPF6002G,PFT with Flow-Volume Curve(기본폐기능검사),20181109,,PFT FEV1 %Pred,-64.31,-64.31,PU01,-,            ,2018110946007.0,%Pred,FEV1,Pre_PFT
+6915443,,,,,OPF6002G,PFT with Flow-Volume Curve(기본폐기능검사),20181109,,PFT FVC %Pred,-84.71,-84.71,PU01,-,            ,2018110946007.0,%Pred,FVC,Pre_PFT

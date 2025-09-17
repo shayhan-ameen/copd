@@ -507,7 +507,7 @@ def log_uniques(col: str, uniques: list) -> None:
 
 
 def extract_test_measurement_variable(
-    df_path: str | Path = INTERIM_DATA_DIR / "ALL_PRESCRIPTION_DATA_FILTERED.csv",
+    df_path: str | Path = INTERIM_DATA_DIR / "ALL_PRESCRIPTION_DATA.csv",
     output_path: str | Path = INTERIM_DATA_DIR / "ALL_PRESCRIPTION_DATA_TMV.csv",
     save_parquet: bool = False,
 ) -> pd.DataFrame:
@@ -523,75 +523,43 @@ def extract_test_measurement_variable(
 
     # ---- 2) Quick stats ----
     logger.info(f"Number of unique patients: {df['Patient Number'].nunique()}")
-    df["Test"] = df["Prescription Name"].astype(str).str.strip()
-    logger.info(f"=== Number of unique Test Before Merging===")
+    df["Result item name"] = df["Result item name"].astype("string")
+    logger.info(f"Number of unique Result item name: {df['Result item name'].nunique()}")
+    # logger.info(f"Uique Result item name: {df['Result item name'].unique()}")
+    log_uniques("Result item name", df["Result item name"].dropna().unique().tolist())
+
+    # ---- 3) Normalize source strings ----
+    s = df["Result item name"].fillna("")
+
+    pat = r"((?:Post_)?[^ _]+)$"  # last chunk; keep leading Post_ if present
+
+    # Put the last token in Variable
+    df["Variable"] = s.str.extract(pat, expand=False)
+
+    # prefix Test+Measurement / Measurement:
+    prefix = s.str.replace(pat, "", regex=True).str.rstrip(" _")  # e.g. "CO Diffusing DLCO", "FVC"
+
+    # split from the RIGHT once → [Test, Measurement]
+    parts = prefix.str.rsplit(" ", n=1, expand=True)
+
+    # parts has columns 0 (Test prefix) and 1 (Measurement), with some 1 = None
+    mask = parts[1].isna()  # True where parts[1] is None/NaN
+
+    # move 0 -> 1, and clear 0
+    parts.loc[mask, 1] = parts.loc[mask, 0]
+    parts.loc[mask, 0] = pd.NA
+
+    # now build final columns
+    df["Measurement"] = parts[1]
+    df["Test"] = parts[0]
+
+    # If Test is empty, copy from Prescription Name
+    df["Test"] = df["Test"].fillna(df["Prescription Name"])
+
+    # turn blanks back to NA (optional)
+    df.loc[s.eq(""), ["Measurement", "Variable"]] = pd.NA
+
     log_uniques("Test", df["Test"].dropna().unique().tolist())
-    test_mapping = {
-        "Bronchodilator Test": "Post_BD",
-        "[협진]Bronchodilator Test": "Post_BD",
-        "[임상] Bronchodilator Test": "Post_BD",
-        "[협진]CO Diffusing Capacity Measurement": "COD",
-        "CO Diffusing Capacity Measurement": "COD",
-        "Plethysmography": "Plethysmography",
-        "PFT with Flow-Volume Curve(기본폐기능검사)": "Pre_PFT",
-        "[응급] PFT with Flow-Volume Curve(기본폐기능검사)": "Pre_PFT",
-        "[임상] PFT with Flow-Volume Curve(기본폐기능검사)": "Pre_PFT",
-        "[협진]PFT with Flow-Volume Curve(기본폐기능검사)": "Pre_PFT",
-        "PFT without Flow-Volume Curve[수술전검사]": "Pre_PFT",
-        # ? If you need to separate with/without flow-volume later, switch to the mappings below:
-        # "PFT with Flow-Volume Curve(기본폐기능검사)": "Pre_PFT_w",
-        # "[응급] PFT with Flow-Volume Curve(기본폐기능검사)": "Pre_PFT_w",
-        #  "[임상] PFT with Flow-Volume Curve(기본폐기능검사)": "Pre_PFT_w",
-        # "[협진]PFT with Flow-Volume Curve(기본폐기능검사)": "Pre_PFT_w",
-        # "PFT without Flow-Volume Curve[수술전검사]": "Pre_PFT_wo",
-    }
-    df["Test"] = df["Test"].replace(test_mapping)
-    logger.info(f"=== Number of unique Test After Merging===")
-    log_uniques("Test", df["Test"].dropna().unique().tolist())
-
-    df["M_V"] = df["Result item name"].astype(str).str.strip()
-    logger.info(f"=== Number of unique Measurement + Variable ===")
-    log_uniques("M_V", df["M_V"].dropna().unique().tolist())
-
-    # Remove redundant prefixes that duplicate Test names to clean M_V for specific Tests
-    df.loc[df["Test"] == "COD", "M_V"] = df.loc[df["Test"] == "COD", "M_V"].str.removeprefix(
-        "CO Diffusing "
-    )
-    df.loc[df["Test"] == "Plethysmography", "M_V"] = df.loc[
-        df["Test"] == "Plethysmography", "M_V"
-    ].str.removeprefix("Plethysmography ")
-    df.loc[df["Test"] == "Post_BD", "M_V"] = df.loc[
-        df["Test"] == "Post_BD", "M_V"
-    ].str.removeprefix("Bronchodilator ")
-    df.loc[df["Test"] == "Post_BD", "M_V"] = df.loc[
-        df["Test"] == "Post_BD", "M_V"
-    ].str.removeprefix("PBronchodilator ")
-    df.loc[df["Test"] == "Pre_PFT", "M_V"] = df.loc[
-        df["Test"] == "Pre_PFT", "M_V"
-    ].str.removeprefix("PFT ")
-
-    # Split M_V into Measurement (left of first space/underscore) and Variable (rest)
-    s = df["M_V"].astype(str).str.replace("_", " ", regex=False).str.strip()
-    parts = s.str.partition(" ")  # DataFrame with cols 0=left, 1=sep, 2=right
-
-    df["Measurement"] = parts[0]  # e.g., 'FEV1', 'DLCO', 'FEF25~75%'
-    df["Variable"] = parts[2].replace(
-        "", pd.NA
-    )  # e.g., 'Meas', 'Pred', '%Pred', or NA if no right part
-
-    # # normalize common vendor spellings to canonical names - May not bee needed
-    meas_maping = {
-        "FEF2575": "FEF25~75%",
-        "FET100": "FET100%",
-        "FEV1FVC": "FEV1/FVC",
-        "DLCOVA": "DLCO/VA",
-    }
-    df["Measurement"] = (
-        df["Measurement"].astype(str).str.strip()
-    )  # ensure clean tokens before replace
-    df["Measurement"] = df["Measurement"].replace(
-        meas_maping
-    )  # exact-key mapping to canonical labels
     log_uniques("Measurement", df["Measurement"].dropna().unique().tolist())
     log_uniques("Variable", df["Variable"].dropna().unique().tolist())
 
@@ -607,7 +575,7 @@ def extract_test_measurement_variable(
 
 
 def filter_relevant_measurements(
-    df_path: str | Path = INTERIM_DATA_DIR / "ALL_PRESCRIPTION_DATA.csv",
+    df_path: str | Path = INTERIM_DATA_DIR / "ALL_PRESCRIPTION_DATA_TMV.csv",
     desired_items: list[str] | None = None,  # default set below
     match: str = "exact",  # "exact" or "contains"
     output_path: str | Path = INTERIM_DATA_DIR / "ALL_PRESCRIPTION_DATA_FILTERED.csv",
@@ -623,11 +591,12 @@ def filter_relevant_measurements(
     df_path = Path(df_path)
     output_path = Path(output_path)
 
-    # if desired_items is None:
-    #     desired_items = ["FVC", "FEV1", "DLCO", "FEV1/FVC"]  # sensible default
+    if desired_items is None:
+        desired_items = ["FVC", "FEV1", "DLCO", "FEV1/FVC"]  # sensible default
 
     # read as text to avoid dtype warnings / keep leading zeros
-    df = pd.read_csv(df_path, dtype=str, encoding="utf-8-sig", low_memory=False)
+    df_org = pd.read_csv(df_path, dtype=str, encoding="utf-8-sig", low_memory=False)
+    df = df_org.copy()
 
     logger.info(f"Unique patients before filtering: {df['Patient Number'].nunique()}")
 
@@ -647,45 +616,45 @@ def filter_relevant_measurements(
         f"Unique patients after filtering patients < 3 years: {df['Patient Number'].nunique()}"
     )
 
-    # # Filter patients with desired measurements
-    # logger.info(f"Desired items: {desired_items}")
-    # # build mask
-    # if match == "exact":
-    #     mask = df["Measurement"].isin(desired_items)
-    # elif match == "contains":
-    #     pattern = "|".join(map(re.escape, desired_items))  # safe OR-pattern
-    #     mask = df["Measurement"].astype(str).str.contains(pattern, na=False)
-    # else:
-    #     raise ValueError("match must be 'exact' or 'contains'")
+    # Filter patients with desired measurements
+    logger.info(f"Desired items: {desired_items}")
+    # build mask
+    if match == "exact":
+        mask = df["Measurement"].isin(desired_items)
+    elif match == "contains":
+        pattern = "|".join(map(re.escape, desired_items))  # safe OR-pattern
+        mask = df["Measurement"].astype(str).str.contains(pattern, na=False)
+    else:
+        raise ValueError("match must be 'exact' or 'contains'")
 
-    # # df_filtered = df[mask].copy()
-    # df = df[mask]
+    # df_filtered = df[mask].copy()
+    df = df[mask]
 
-    # # Filter by Tests
-    # df = df.rename(columns={"Test": "Temp_Test"})
+    # Filter by Tests
+    df = df.rename(columns={"Test": "Temp_Test"})
 
-    # def map_test(val):
-    #     if "CO Diffusing" in val:
-    #         return "COD"
-    #     elif "Bronchodilator" in val:
-    #         return "Post_BD"
-    #     elif "PFT" in val:
-    #         return "Pre_PFT"
-    #     else:
-    #         return None
+    def map_test(val):
+        if "CO Diffusing" in val:
+            return "COD"
+        elif "Bronchodilator" in val:
+            return "Post_BD"
+        elif "PFT" in val:
+            return "Pre_PFT"
+        else:
+            return None
 
-    # df["Test"] = df["Temp_Test"].apply(map_test)
-    # df = df.drop(columns=["Temp_Test"])
-    # if df["Test"].isna().any():
-    #     logger.warning("Some Temp_Test values could not be mapped to Test.")
+    df["Test"] = df["Temp_Test"].apply(map_test)
+    df = df.drop(columns=["Temp_Test"])
+    if df["Test"].isna().any():
+        logger.warning("Some Temp_Test values could not be mapped to Test.")
 
-    # logger.info(f"Unique Tests: {df['Test'].unique()} ({df['Test'].nunique()})")
+    logger.info(f"Unique Tests: {df['Test'].unique()} ({df['Test'].nunique()})")
 
-    # log_uniques("Measurement after filtering", df["Measurement"].dropna().unique().tolist())
+    log_uniques("Measurement after filtering", df["Measurement"].dropna().unique().tolist())
 
-    # logger.info(
-    #     f"Unique patients after filtering desired measurements: {df['Patient Number'].nunique()}"
-    # )
+    logger.info(
+        f"Unique patients after filtering desired measurements: {df['Patient Number'].nunique()}"
+    )
 
     # Reorder DataFrame
     desired_columns = [
@@ -705,6 +674,9 @@ def filter_relevant_measurements(
         "Implementation laboratory",
         "Region",
         "Pacs Number",
+        "Variable",
+        "Measurement",
+        "Test",
     ]
     df = df[desired_columns + df.columns.difference(desired_columns).tolist()]
 
@@ -747,9 +719,9 @@ def process_prescription_files(
     sheet_name=0,
 ) -> pd.DataFrame:
     # rename_prescription_files(raw_dir=raw_dir,output_dir=output_dir,audit_csv=audit_csv,sheet_name=sheet_name)
-    # merge_prescription_files()
-    # filter_relevant_measurements()
+    merge_prescription_files()
     extract_test_measurement_variable()
+    filter_relevant_measurements()
     # summarize_pft_df(df)
 
 
