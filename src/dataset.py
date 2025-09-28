@@ -38,18 +38,16 @@
 
 
 from pathlib import Path
-from loguru import logger
-import pandas as pd
+from typing import Any
 
-from src.config import RAW_DATA_DIR, INTERIM_DATA_DIR  # import your globals
-
-from typing import Dict, Any, Tuple
-import pandas as pd
 import numpy as np
-import re
+import pandas as pd
+from loguru import logger
+
+from src.config import INTERIM_DATA_DIR, RAW_DATA_DIR  # import your globals
 
 
-def summarize_pft_df(df: pd.DataFrame, show_values: bool = True) -> Dict[str, Any]:
+def summarize_pft_df(df: pd.DataFrame, show_values: bool = True) -> dict[str, Any]:
     """
     Prints and returns:
       1) total unique patients
@@ -76,9 +74,7 @@ def summarize_pft_df(df: pd.DataFrame, show_values: bool = True) -> Dict[str, An
     vars_u = uniq("Variable")
 
     # ---- (Measurement, Test) value counts (cleaned) ----
-    mt_base = df.loc[
-        df["Measurement"].notna() & df["Test"].notna(), ["Measurement", "Test"]
-    ].copy()
+    mt_base = df.loc[df["Measurement"].notna() & df["Test"].notna(), ["Measurement", "Test"]].copy()
     mt_base["Measurement"] = mt_base["Measurement"].astype(str).str.strip()
     mt_base["Test"] = mt_base["Test"].astype(str).str.strip()
 
@@ -149,8 +145,8 @@ def detect_anomalies(
     measure_col: str = "Measurement",
     variable_col: str = "Variable",
     z_thresh: float = 3.5,
-    jump_thresh_per_month: Dict[str, float] | None = None,
-) -> Tuple[pd.DataFrame, str]:
+    jump_thresh_per_month: dict[str, float] | None = None,
+) -> tuple[pd.DataFrame, str]:
     """
     Returns:
       flagged_df (same rows as dfx, with anomaly columns)
@@ -524,7 +520,7 @@ def extract_test_measurement_variable(
     # ---- 2) Quick stats ----
     logger.info(f"Number of unique patients: {df['Patient Number'].nunique()}")
     df["Test"] = df["Prescription Name"].astype(str).str.strip()
-    logger.info(f"=== Number of unique Test Before Merging===")
+    logger.info("=== Number of unique Test Before Merging===")
     log_uniques("Test", df["Test"].dropna().unique().tolist())
     test_mapping = {
         "Bronchodilator Test": "Post_BD",
@@ -546,11 +542,11 @@ def extract_test_measurement_variable(
         # "PFT without Flow-Volume Curve[수술전검사]": "Pre_PFT_wo",
     }
     df["Test"] = df["Test"].replace(test_mapping)
-    logger.info(f"=== Number of unique Test After Merging===")
+    logger.info("=== Number of unique Test After Merging===")
     log_uniques("Test", df["Test"].dropna().unique().tolist())
 
     df["M_V"] = df["Result item name"].astype(str).str.strip()
-    logger.info(f"=== Number of unique Measurement + Variable ===")
+    logger.info("=== Number of unique Measurement + Variable ===")
     log_uniques("M_V", df["M_V"].dropna().unique().tolist())
 
     # Remove redundant prefixes that duplicate Test names to clean M_V for specific Tests
@@ -688,6 +684,24 @@ def filter_relevant_measurements(
     # )
 
     # Reorder DataFrame
+    # desired_columns = [
+    #     "Patient Number",
+    #     "Gender",
+    #     "Date of Birth",
+    #     "Visit Type",
+    #     "Treatment Date",
+    #     "Prescription Code",
+    #     "Prescription Name",
+    #     "Prescription Date",
+    #     "Implementation Date",
+    #     "Result item name",
+    #     "Result Numerical Value",
+    #     "Result Value",
+    #     "Laboratory",
+    #     "Implementation laboratory",
+    #     "Region",
+    #     "Pacs Number",
+    # ]
     desired_columns = [
         "Patient Number",
         "Gender",

@@ -1,20 +1,15 @@
-# -*- coding: utf-8 -*-
-from concurrent.futures import ProcessPoolExecutor, as_completed
 import itertools
 import os
-from pathlib import Path
 import re
-from typing import Dict, Iterable, List, Tuple
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
 
-from loguru import logger
 import matplotlib
 import matplotlib.dates as mdates
-from matplotlib.lines import Line2D
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from pptx import Presentation
-from pptx.util import Inches, Pt
+from matplotlib.lines import Line2D
 from tqdm import tqdm
 
 from src import dataset
@@ -163,9 +158,9 @@ def plot_patient_variables_grid(
     dfx: pd.DataFrame,
     patient_id: int,
     out_dir: Path = Path(FIGURES_DIR / "pft_plots_all_variants"),
-    plot_variable_order: List[str] = None,
-    wanted_measure_indexes: List[str] = None,
-    measure_index_colors: Dict[str, str] = None,
+    plot_variable_order: list[str] = None,
+    wanted_measure_indexes: list[str] = None,
+    measure_index_colors: dict[str, str] = None,
     marker: str = "o",
     linewidth: float = 1.6,
     plot_anomaly: bool = True,
@@ -277,7 +272,7 @@ def plot_patient_variables_grid(
     handles_all, labels_all = [], []
 
     # ---- plotting per variable ----
-    for ax, var in zip(axes, plot_variable_order):
+    for ax, var in zip(axes, plot_variable_order, strict=False):
         dft_var = dfx[dfx[VAR_COL] == var]
         ax.set_ylabel(var)
         ax.grid(True, linestyle="--", alpha=0.3)

@@ -1,21 +1,23 @@
 {
-  "python.defaultInterpreterPath": "C:\\Users\\Shayahn-DKE\\anaconda3\\envs\\copd\\python.exe",
-  "terminal.integrated.defaultProfile.windows": "Command Prompt",
-  "terminal.integrated.profiles.windows": {
-    "Command Prompt": {
-      "path": "C:\\Windows\\System32\\cmd.exe",
-      "args": [
-        "/K",
-        "C:\\Users\\Shayahn-DKE\\anaconda3\\Scripts\\activate.bat C:\\Users\\Shayahn-DKE\\anaconda3 && conda activate copd"
-      ]
-    }
+  "workbench.colorTheme": "One Dark Pro",
+  "editor.semanticHighlighting.enabled": true,
+  "editor.tokenColorCustomizations": {
+    "textMateRules": [
+      { "scope": ["keyword", "keyword.control", "storage.type"], "settings": { "foreground": "#79C0FF" } },
+      { "scope": ["entity.name.function", "support.function"], "settings": { "foreground": "#A5D6FF" } },
+      { "scope": ["support.type", "entity.name.type", "meta.typehint"], "settings": { "foreground": "#FFA657" } },
+      { "scope": ["variable.other", "variable.parameter.function"], "settings": { "foreground": "#E6EDF3" } }
+    ]
   },
-  "python.terminal.activateEnvironment": true,
-  "python-envs.pythonProjects": [
-    {
-      "path": "",
-      "envManager": "ms-python.python:conda",
-      "packageManager": "ms-python.python:conda"
+  "editor.semanticTokenColorCustomizations": {
+    "rules": {
+      "keyword:python": "#79C0FF",
+      "function:python": "#A5D6FF",
+      "method:python": "#A5D6FF",
+      "type:python": "#FFA657",
+      "class:python": "#FFA657",
+      "parameter:python": "#E6EDF3",
+      "variable:python": "#E6EDF3"
     }
-  ]
+  }
 }

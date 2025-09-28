@@ -1,5 +1,5 @@
+from src.features import build_patients_data
 from src.logging_config import setup_logger
-from src.plots import plot_all_patients_in_parallel
 
 logger = setup_logger(verbose=True)
 
@@ -7,7 +7,8 @@ logger = setup_logger(verbose=True)
 def main():
     logger.info("🚀 Starting main pipeline")
     # dataset.process_prescription_files()  # call function from dataset.py
-    plot_all_patients_in_parallel()
+    # plots.plot_all_patients_in_parallel()
+    build_patients_data()
     logger.success("✅ Pipeline finished successfully")
 
 

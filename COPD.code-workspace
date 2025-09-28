@@ -4,6 +4,8 @@
 			"path": "."
 		}
 	],
+	"settings": {},
+	 
 	// "settings": {
 	// 	"terminal.integrated.defaultProfile.windows": "Command Prompt",
 	// 	"terminal.integrated.profiles.windows": {
@@ -16,4 +18,5 @@
 	// 		}
 	// 	}
 	// }
+	
 }

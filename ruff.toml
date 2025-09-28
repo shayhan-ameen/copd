@@ -1,3 +1,5 @@
 line-length = 100
 extend-include = ["*.ipynb"]
+
+[lint]
 select = ["E", "F", "I", "B", "UP"]
