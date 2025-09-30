@@ -10,7 +10,7 @@ import torch
 from xgboost import XGBRegressor
 
 # Your dataset builder
-from src.modeling.ragged_timeseries import COPDGRUDDataset
+from src.modeling.ragged_timeseries import TimeSeriesDataset
 
 
 # --------------------------
@@ -68,7 +68,7 @@ def count_observed_per_feature(M: np.ndarray) -> np.ndarray:
 
 
 def build_tabular_from_dataset(
-    ds: COPDGRUDDataset,
+    ds: TimeSeriesDataset,
     *,
     include_last: bool = True,
     include_mean: bool = True,
@@ -190,7 +190,7 @@ def run_xgb_cv(
     out_path.mkdir(parents=True, exist_ok=True)
 
     # Build dataset (include age/gender/dt if desired in aggregates)
-    ds = COPDGRUDDataset(
+    ds = TimeSeriesDataset(
         pkl_path,
         include_age=True,
         include_gender=True,

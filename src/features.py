@@ -255,8 +255,8 @@ def _make_single_timestamp_features(
         visit_df, test_col, meas_col, var_col, value_col
     )
     single = {
-        "Gender": gender,
         "Age": age_years,
+        "Gender": gender,
         "dt_gap_days": dt_gap_days if dt_gap_days is not None else 0,
         "clinical_values": clinical_values,
     }

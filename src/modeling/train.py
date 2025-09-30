@@ -43,7 +43,7 @@ from torch import nn
 from torch.utils.data import DataLoader, random_split
 
 from src.modeling.architectures.GRUD import GRUDRegressor
-from src.modeling.ragged_timeseries import COPDGRUDDataset, collate_grud
+from src.modeling.ragged_timeseries import TimeSeriesDataset, collate_grud
 
 
 def compute_feature_means(loader: DataLoader) -> torch.Tensor:
@@ -115,7 +115,9 @@ def train_main(
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
-    ds = COPDGRUDDataset(pkl_path, include_age=True, include_gender=False, include_dt_feature=False)
+    ds = TimeSeriesDataset(
+        pkl_path, include_age=True, include_gender=False, include_dt_feature=False
+    )
 
     # with open("data/processed/COPDGRUDDataset.pkl", "wb") as f:
     #     pickle.dump(ds, f, protocol=pickle.HIGHEST_PROTOCOL)

@@ -9,7 +9,7 @@ from torch import nn
 from torch.utils.data import DataLoader, Subset
 
 # If these live elsewhere, adjust imports accordingly
-from src.modeling.ragged_timeseries import COPDGRUDDataset, collate_grud
+from src.modeling.ragged_timeseries import TimeSeriesDataset, collate_grud
 
 
 # ----------------------------
@@ -57,8 +57,13 @@ class SimpleGRURegressor(nn.Module):
         X: (B, T, Din)
         lengths: (B,) int64 lengths (descending order not required; enforce_sorted=False)
         """
+        # Sanity check (remove after debugging for speed)
+        # assert lengths.device.type == "cpu", f"lengths on {lengths.device}, expected cpu"
         packed = nn.utils.rnn.pack_padded_sequence(
-            X, lengths.cpu(), batch_first=True, enforce_sorted=False
+            X,
+            lengths,
+            batch_first=True,
+            enforce_sorted=False,
         )
         _, h_n = self.gru(packed)  # h_n: (num_layers * num_directions, B, H)
         last = h_n[-1]  # final layer, last direction → (B, Hout)
@@ -77,18 +82,33 @@ def set_seed(seed: int = 42):
 def batch_to_device(
     batch: dict[str, torch.Tensor], device: torch.device
 ) -> dict[str, torch.Tensor]:
-    return {k: v.to(device) for k, v in batch.items()}
+    # return {k: v.to(device) for k, v in batch.items()}
+    out = {}
+    for k, v in batch.items():
+        if k == "lengths":
+            out[k] = v  # keep on CPU for pack_padded_sequence
+        elif torch.is_tensor(v):
+            out[k] = v.to(device, non_blocking=True)
+        else:
+            out[k] = v
+    return out
 
 
 def make_loader(ds, idxs: Iterable[int], batch_size: int, shuffle: bool) -> DataLoader:
     subset = Subset(ds, list(idxs))
+    nw = 2  # min(max((os.cpu_count() or 8) - 2, 4), 16)
+    pf = 8  # prefetch 6 batches/worker
     return DataLoader(
         subset,
         batch_size=batch_size,
         shuffle=shuffle,
-        num_workers=4,
         pin_memory=True,
         collate_fn=collate_grud,
+        # num_workers=nw,
+        # persistent_workers=(nw > 0),  # NEW: keep workers alive across epochs
+        # prefetch_factor=pf if nw > 0 else None,  # NEW: more batches ready ahead of time
+        # prefetch_factor=pf,  # NEW: more batches ready ahead of time
+        # drop_last=shuffle, # OPTIONAL: True for train to avoid tiny last batch
     )
 
 
@@ -175,9 +195,9 @@ def evaluate(
 
 
 # ----------------------------
-# 4) 5-Fold CV (outer train/test) + inner val + early stopping
+# 4) K-Fold CV (outer train/test) + inner val + early stopping
 # ----------------------------
-def run_5fold_cv_earlystop(
+def run_k_fold_cv_earlystop(
     pkl_path: str = "data/processed/COPD_PATIENTS_DATA.pkl",
     out_dir: str = "models/exp_simple_gru_cv_es",
     *,
@@ -193,9 +213,10 @@ def run_5fold_cv_earlystop(
     concat_XM: bool = True,  # True → feed [X||M]; False → only X
     val_frac: float = 0.1,  # inner validation fraction from outer-train
     patience: int = 5,  # early stopping patience on val MSE
+    cv: int = 5,  # number of outer folds
 ):
     """
-    Outer 5-fold CV:
+    Outer K-Fold CV:
       - Split dataset into (train, test).
       - From 'train', create (train_inner, val_inner) by val_frac.
       - Train with early stopping on validation MSE (patience).
@@ -206,17 +227,11 @@ def run_5fold_cv_earlystop(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    ds = COPDGRUDDataset(
-        pkl_path,
-        include_age=True,
-        include_gender=True,
-        include_dt_feature=True,
-    )
-
+    ds = TimeSeriesDataset(compute=False)
     N = len(ds)
     print(f"Dataset size: N={N} samples")
-    if N < 5:
-        raise ValueError(f"Dataset too small for 5-fold CV: N={N}")
+    if N < cv:
+        raise ValueError(f"Dataset too small for {cv}-fold CV: N={N}")
 
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -231,7 +246,7 @@ def run_5fold_cv_earlystop(
     fold_train_mse, fold_val_mse, fold_test_mse = [], [], []
 
     for fold, (train_idx, test_idx) in enumerate(
-        kfold_train_test_indices(N, k=5, seed=seed), start=1
+        kfold_train_test_indices(N, k=cv, seed=seed), start=1
     ):
         print(f"\n=== Fold {fold} ===")
         fold_dir = out_path / f"fold_{fold}"
@@ -348,7 +363,7 @@ def run_5fold_cv_earlystop(
         f.write(f"avg_val_mse={val_avg:.6f} ± {val_std:.6f}\n")
         f.write(f"avg_test_mse={test_avg:.6f} ± {test_std:.6f}\n")
 
-    print("\n=== 5-fold CV (Early Stopping) Summary ===")
+    print(f"\n=== {cv}-fold CV (Early Stopping) Summary ===")
     print(f"Train MSE: {train_avg:.6f} ± {train_std:.6f}")
     print(f"Val   MSE: {val_avg:.6f} ± {val_std:.6f}")
     print(f"Test  MSE: {test_avg:.6f} ± {test_std:.6f}")
@@ -358,19 +373,20 @@ def run_5fold_cv_earlystop(
 # 5) CLI entry
 # ----------------------------
 if __name__ == "__main__":
-    run_5fold_cv_earlystop(
+    run_k_fold_cv_earlystop(
         pkl_path="data/processed/COPD_PATIENTS_DATA.pkl",
         out_dir="models/exp_simple_gru_cv_es",
-        batch_size=64,
+        batch_size=128,  # 64,
         hidden_size=64,
-        num_layers=1,
+        num_layers=1,  #! try 2 or 3 layers too
         dropout=0.0,
         bidirectional=False,
         fc_hidden=64,  # set None to use a single Linear
-        epochs=100,  # upper bound; early stopping will usually stop sooner
+        epochs=10,  # upper bound; early stopping will usually stop sooner
         lr=3e-4,
         seed=42,
         concat_XM=True,  # feed [X||M]; recommended when zeros denote missing
         val_frac=0.1,  # 10% of outer-train becomes inner-val
         patience=5,  # stop if no val improvement for 5 epochs
+        cv=5,  # 5-fold cross-validation
     )
