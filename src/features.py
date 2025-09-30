@@ -58,14 +58,15 @@ CLINICAL_MAP: dict[str, dict[str, Iterable[str]]] = OrderedDict(
         ),
         "Post_BD": OrderedDict(
             {
+                #! Add Post_Measurement
                 "FEF/FIF50": {"Meas", "%Chg."},
                 "FEF25%": {"Meas", "%Chg."},
                 "FEF50%": {"Meas", "%Pred", "%Chg."},
-                "FEF25~75%": {"Meas", "%Pred", "%Chg."},
+                "FEF25~75%": {"Meas", "%Pred", "%Chg.", "Post_Meas"},
                 "FEF75%": {"Meas", "%Pred", "%Chg."},
-                "FET100%": {"Meas", "%Chg."},
-                "FEV1": {"Meas", "%Pred", "%Chg."},
-                "FEV1/FVC": {"Meas", "%Pred", "%Chg."},
+                "FET100%": {"Meas", "%Chg.", "Post_Meas"},
+                "FEV1": {"Meas", "%Pred", "%Chg.", "Post_Meas"},
+                "FEV1/FVC": {"Meas", "%Pred", "%Chg.", "Post_Meas"},
                 "FIV1": {"Meas", "%Chg."},
                 "FIVC": {"Meas", "%Pred", "%Chg."},
                 "FVC": {"Meas", "%Pred", "%Chg."},
@@ -104,7 +105,7 @@ def _norm_alnum(s: str) -> str:
 
 
 def _norm_contains(hay: str, needle: str) -> bool:
-    # ! problem hay is hay = "DLCO/VA test" and needle = "DLCO"
+    #! problem hay is hay = "DLCO/VA test" and needle = "DLCO"
     """True if normalized 'needle' is a substring of normalized 'hay'."""
     return _norm_alnum(needle) in _norm_alnum(hay)
 
@@ -123,7 +124,9 @@ def _age_years_from(dob: pd.Timestamp | None, on_date: pd.Timestamp | None) -> i
 class TargetSpec:
     # test_priority: tuple[str, str] = ("Post_BD", "Pre_PFT")  # prefer Post_BD, fallback Pre_PFT
     test_priority: tuple[str, ...] = ("Pre_PFT",)  # prefer Pre_PFT
+    #! Target is FEV1/FVC or FEV1
     measurement: str = "FEV1"
+    # measurement: str = "FEV1/FVC"
     variable: str = "Meas"  # FEV1 Meas
 
 
@@ -329,12 +332,15 @@ def _build_single_patient_record(
         ts_list.append(single)
 
     out = {
-        "patient_timeseries": ts_list,
-        "y": float(y_value),
+        "patient_id": pid,
+        "dob": dob_val,
+        "gender": gender_val,
         "number_of_visit": int(num_visits),
+        "y": float(y_value),
         "y_index": int(y_index),
         "y_source": y_source,
         "y_date": pd.Timestamp(visit_dates[y_index]),
+        "patient_timeseries": ts_list,
     }
     return pid, out
 

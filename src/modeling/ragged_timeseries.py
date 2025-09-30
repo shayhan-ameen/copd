@@ -124,17 +124,18 @@ class COPDGRUDDataset(Dataset):
         self.include_dt_feature = include_dt_feature
 
         # prebuild index of valid patients (at least 1 history step)
-        self.index: list[tuple[Any, dict[str, Any]]] = []
+        self.index: list[Any] = []
         for pid, rec in self.data.items():
             T = len(rec.get("patient_timeseries", []))  # T = number of visits
             if T >= 1 and rec.get("y") is not None:
-                self.index.append((pid, rec))
+                self.index.append(pid)
 
     def __len__(self) -> int:
         return len(self.index)
 
     def __getitem__(self, i: int) -> dict[str, torch.Tensor]:
-        pid, rec = self.index[i]
+        pid = self.index[i]
+        rec = self.data[pid]
         visits: list[dict[str, Any]] = rec["patient_timeseries"]  # history only, ascending
 
         X_list: list[torch.Tensor] = []
@@ -166,6 +167,7 @@ class COPDGRUDDataset(Dataset):
             DT=DT,  # (T,) # time gap since last visit (0 for first visit)
             length=torch.tensor(T, dtype=torch.long),  # sequence length T
             y=torch.tensor(float(rec["y"]), dtype=torch.float32),  # scalar target
+            pid=pid,
         )
 
 

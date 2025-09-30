@@ -1,8 +1,12 @@
 import itertools
 import os
+import pickle
 import re
+from collections import OrderedDict
+from collections.abc import Iterable
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+from typing import Any
 
 import matplotlib
 import matplotlib.dates as mdates
@@ -461,6 +465,209 @@ def plot_all_patients_in_parallel():
     #     futures = [ex.submit(_plot_one, t) for t in tasks]
     #     for fut in as_completed(futures):
     #         logger.info(f"✓ plotted patient {fut.result()}")
+
+
+PLOT_MAP: dict[str, dict[str, Iterable[str]]] = OrderedDict(
+    {
+        "Pre_PFT": OrderedDict(
+            {
+                "FEV1": {"Meas"},
+                "FEV1/FVC": {"Meas"},
+            }
+        ),
+        "Post_BD": OrderedDict(
+            {
+                "FEV1": {"Meas", "Post Meas"},
+                "FEV1/FVC": {"Meas", "Post Meas"},
+            }
+        ),
+        "COD": OrderedDict(
+            {
+                "DLCO": {"Meas"},
+            }
+        ),
+    }
+)
+
+
+def plot_patient_timeseries(
+    pid,
+    y_pred,
+    error,
+    rec,
+    prefix: str = "Best",
+    plot_map: dict[str, dict[str, Iterable[str]]] = PLOT_MAP,
+    *,
+    put_dir: Path | None = Path(FIGURES_DIR, "patient_timeseries"),
+    figsize: tuple[int, int] = (10, 8),
+) -> Path:
+    """
+    Two subplots (2 rows × 1 column):
+      - Top: Post_BD and Pre_PFT together
+      - Bottom: COD
+    X-axis = days before target (negative; 0 is y_date).
+    Converts FEV1/FVC Meas from % to 0–1 if any value > 5.
+    """
+    visits: list[dict[str, Any]] = rec.get("patient_timeseries", [])
+    if not visits:
+        raise ValueError(f"PID {pid} has no history visits to plot.")
+
+    n_visits = rec.get("number_of_visit", len(visits))
+    y_true = rec.get("y", None)
+
+    def _norm_value(meas: str, var: str, v: float | None) -> float | None:
+        if v is None or pd.isna(v):
+            return None
+        if meas == "FEV1/FVC" and var == "Meas":
+            return v / 10.0 if v > 5 else v
+        return v
+
+    # Panels definition
+    top_tests = ["Post_BD", "Pre_PFT"]
+    bottom_tests = ["COD"]
+
+    # Collect series per panel
+    # panel_series[panel_idx][label] -> list[(t_rel, val)]
+    panel_series: dict[int, dict[str, list[tuple[int, float]]]] = {0: {}, 1: {}}
+    markers_by_label: dict[int, dict[str, str]] = {0: {}, 1: {}}
+
+    def _pick_marker(measurement: str) -> str:
+        # Distinct markers for key measurements; default for others
+        if measurement == "FEV1":
+            return "s"  # square
+        if measurement == "FEV1/FVC":
+            return "^"  # triangle
+        return "o"  # default
+
+    for v in visits:
+        t_rel = -int(v.get("dt_gap_days", 0))
+        cvals = v.get("clinical_values", {})
+
+        # Helper to collect for a set of tests into a panel
+        def collect_for_tests(tests: list[str], panel_idx: int):
+            for test in tests:
+                meas_map = plot_map.get(test, {})
+                if not meas_map:
+                    continue
+                t_block = cvals.get(test, {})
+                if not t_block:
+                    continue
+                for meas, var_set in meas_map.items():
+                    m_block = t_block.get(meas, {})
+                    if not m_block:
+                        continue
+                    for var in var_set:
+                        val = _norm_value(meas, var, m_block.get(var))
+                        # print(f"Processing: {test} | {meas} | {var} = {m_block.get(var)} -> {val}")
+                        if val is None or pd.isna(val):
+                            continue
+                        label = f"{test} · {meas} | {var}"  # include test so lines are distinct
+                        panel_series[panel_idx].setdefault(label, []).append((t_rel, float(val)))
+                        markers_by_label[panel_idx][label] = _pick_marker(meas)
+
+        collect_for_tests(top_tests, panel_idx=0)
+        collect_for_tests(bottom_tests, panel_idx=1)
+
+    # Plot (2 rows × 1 column)
+    fig, axes = plt.subplots(2, 1, figsize=figsize, sharex=True)
+
+    panel_titles = ["Post_BD + Pre_PFT", "COD"]
+    for i, ax in enumerate(axes):
+        series = panel_series[i]
+        # print(f"Panel {i} series keys: {list(series.keys())}")
+        any_plotted = False
+        for label, tv in series.items():
+            tv = sorted(tv, key=lambda x: x[0])
+            xs, ys = zip(*tv, strict=False)
+            # ax.plot(xs, ys, marker="o", linewidth=1.6, label=label)
+            mk = markers_by_label[i].get(label, "o")
+            ax.plot(xs, ys, marker=mk, linewidth=1.6, label=label)
+            any_plotted = True
+
+        if i == 0:
+            if y_true is not None:
+                ax.axhline(y_true, linestyle="--", linewidth=1.2, alpha=0.7, label="y_true")
+
+            # NEW: add day-0 markers for y_true and y_pred
+            if y_true is not None:
+                ax.scatter([0], [y_true], s=50, marker="X", zorder=4, label="y_true @ 0d")
+            if y_pred is not None:
+                ax.scatter([0], [y_pred], s=50, marker="D", zorder=4, label="y_pred @ 0d")
+
+        ax.set_title(panel_titles[i])
+        ax.grid(True, alpha=0.3)
+        if any_plotted:
+            ax.legend(loc="best", fontsize=9)
+        else:
+            ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
+
+    axes[-1].set_xlabel("Days before target (y_date)")
+    axes[0].set_ylabel("Value")
+    axes[1].set_ylabel("Value")
+
+    title_bits = [f"PID={pid}", f"visits={n_visits}"]
+    if y_true is not None:
+        title_bits.append(f"y_true={y_true:.3f}")
+    if y_pred is not None:
+        title_bits.append(f"y_pred={y_pred:.3f}")
+    if error is None and (y_true is not None and y_pred is not None):
+        error = abs(y_true - y_pred)
+    if error is not None:
+        title_bits.append(f"error={error:.3f}")
+
+    title_info = " | ".join(title_bits)
+    title_note = "Note: FEV1/FVC 'Meas' is divided by 10 for visualization (e.g., 71.5 → 7.15)."
+    fig.suptitle(f"{title_info}\n{title_note}", y=0.98)
+
+    if put_dir is None:
+        put_dir = Path(FIGURES_DIR) / "patient_timeseries"  # or pass put_dir explicitly
+    put_dir.mkdir(parents=True, exist_ok=True)
+    out_path = (
+        put_dir / f"{prefix}_e_{int(error) if error is not None else ''}_pid_{pid}_timeseries.png"
+    )
+
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+def plot_patients_timeseries(
+    pkl_path: str = "data/processed/COPD_PATIENTS_DATA.pkl",
+):
+    """
+    Plot patients.
+
+    """
+    with open(pkl_path, "rb") as f:
+        patients_data: dict[Any, dict[str, Any]] = pickle.load(f)
+
+    model_report_path = (
+        Path(MODELS_DIR) / "xgb_cv_no_es" / "all_folds_test_predictions_sorted_by_error.csv"
+    )
+    df = pd.read_csv(model_report_path)
+    df_sorted = df.sort_values(by="error", ascending=True)
+    # print(df_sorted.tail(5))
+    # Plot Best
+    num_plot = 10
+    # Pick top-N worst (largest error) and top-N best (smallest error)
+    best = df_sorted.head(num_plot)  # since sorted ascending, head = smallest errors
+    worst = df_sorted.tail(num_plot)  # tail = largest errors
+
+    for prefix, subset in (("Best", best), ("Worst", worst)):
+        for _, row in subset.iterrows():
+            pid = int(row["pid"])
+            y_pred = float(row["y_pred"])
+            err = float(row["error"]) if pd.notna(row["error"]) else None
+
+            if pid not in patients_data:
+                print(f"Skip PID {pid} (not in patients_data)")
+                continue
+
+            rec = patients_data[pid]
+            img_path = plot_patient_timeseries(pid, y_pred, err, rec, prefix=prefix)
+            err_str = "NA" if err is None else f"{err:.3f}"
+            print(f"{prefix}: Plotted PID {pid} (error={err_str})")
 
 
 if __name__ == "__main__":
