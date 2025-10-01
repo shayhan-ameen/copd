@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from loguru import logger
 from torch import nn
 from torch.utils.data import DataLoader, Subset
 
@@ -64,6 +65,7 @@ class SimpleGRURegressor(nn.Module):
             lengths,
             batch_first=True,
             enforce_sorted=False,
+            # enforce_sorted=True,
         )
         _, h_n = self.gru(packed)  # h_n: (num_layers * num_directions, B, H)
         last = h_n[-1]  # final layer, last direction → (B, Hout)
@@ -241,6 +243,7 @@ def run_k_fold_cv_earlystop(
     tmp_batch = next(iter(tmp_loader))
     D = tmp_batch["X"].shape[-1]
     Din = D * 2 if concat_XM else D
+    T = int(tmp_batch["lengths"][0].item())
     print(f"Base feature dim D={D} → GRU input_size={Din} (concat_XM={concat_XM})")
 
     fold_train_mse, fold_val_mse, fold_test_mse = [], [], []
@@ -284,7 +287,7 @@ def run_k_fold_cv_earlystop(
         for epoch in range(1, epochs + 1):
             tr = train_one_epoch(model, train_loader, optim, device, concat_XM=concat_XM)
             va = evaluate(model, val_loader, device, concat_XM=concat_XM)
-            print(f"[Fold {fold} | Epoch {epoch:03d}] train MSE={tr:.6f} | val MSE={va:.6f}")
+            # print(f"[Fold {fold} | Epoch {epoch:03d}] train MSE={tr:.6f} | val MSE={va:.6f}")
 
             if va < best_val - 1e-8:  # tiny tolerance
                 best_val = va
@@ -312,9 +315,9 @@ def run_k_fold_cv_earlystop(
             else:
                 no_improve += 1
                 if no_improve >= patience:
-                    print(
-                        f"Early stopping (patience={patience}) at epoch {epoch}. Best epoch={best_epoch}."
-                    )
+                    # print(
+                    #     f"Early stopping (patience={patience}) at epoch {epoch}. Best epoch={best_epoch}."
+                    # )
                     break
 
         # Load best and evaluate on TEST set
@@ -338,9 +341,9 @@ def run_k_fold_cv_earlystop(
             f.write(f"val_mse_best={val_mse_final:.6f}\n")
             f.write(f"test_mse={test_mse:.6f}\n")
 
-        print(
-            f"Fold {fold} → best_epoch={best_epoch} | train@best={train_mse_final:.6f} | val_best={val_mse_final:.6f} | test={test_mse:.6f}"
-        )
+        # print(
+        #     f"Fold {fold} → best_epoch={best_epoch} | train@best={train_mse_final:.6f} | val_best={val_mse_final:.6f} | test={test_mse:.6f}"
+        # )
 
         fold_train_mse.append(float(train_mse_final))
         fold_val_mse.append(float(val_mse_final))
@@ -354,19 +357,66 @@ def run_k_fold_cv_earlystop(
     val_avg, val_std = stats(fold_val_mse)
     test_avg, test_std = stats(fold_test_mse)
 
+    # --- NEW: per-fold RMSE + summary ---
+    fold_train_rmse = [float(m) ** 0.5 for m in fold_train_mse]
+    fold_val_rmse = [float(m) ** 0.5 for m in fold_val_mse]
+    fold_test_rmse = [float(m) ** 0.5 for m in fold_test_mse]
+
+    train_rmse_avg, train_rmse_std = stats(fold_train_rmse)
+    val_rmse_avg, val_rmse_std = stats(fold_val_rmse)
+    test_rmse_avg, test_rmse_std = stats(fold_test_rmse)
+
     with open(out_path / "cv_summary.txt", "w") as f:
-        for i, (tr, va, te) in enumerate(
-            zip(fold_train_mse, fold_val_mse, fold_test_mse, strict=False), start=1
+        for i, (tr, va, te, trr, var, ter) in enumerate(
+            zip(
+                fold_train_mse,
+                fold_val_mse,
+                fold_test_mse,
+                fold_train_rmse,
+                fold_val_rmse,
+                fold_test_rmse,
+                strict=False,
+            ),
+            start=1,
         ):
             f.write(f"fold_{i}_train_mse={tr:.6f} | val_mse={va:.6f} | test_mse={te:.6f}\n")
+            f.write(f"fold_{i}_train_rmse={trr:.6f} | val_rmse={var:.6f} | test_rmse={ter:.6f}\n")
         f.write(f"avg_train_mse={train_avg:.6f} ± {train_std:.6f}\n")
         f.write(f"avg_val_mse={val_avg:.6f} ± {val_std:.6f}\n")
         f.write(f"avg_test_mse={test_avg:.6f} ± {test_std:.6f}\n")
+        f.write(f"avg_train_rmse={train_rmse_avg:.6f} ± {train_rmse_std:.6f}\n")
+        f.write(f"avg_val_rmse={val_rmse_avg:.6f} ± {val_rmse_std:.6f}\n")
+        f.write(f"avg_test_rmse={test_rmse_avg:.6f} ± {test_rmse_std:.6f}\n")
 
-    print(f"\n=== {cv}-fold CV (Early Stopping) Summary ===")
-    print(f"Train MSE: {train_avg:.6f} ± {train_std:.6f}")
-    print(f"Val   MSE: {val_avg:.6f} ± {val_std:.6f}")
-    print(f"Test  MSE: {test_avg:.6f} ± {test_std:.6f}")
+    # print(f"\n=== {cv}-fold CV (Early Stopping) Summary ===")
+    # print(
+    #     f"Train RMSE: {train_rmse_avg:.2f}±{train_rmse_std:.2f} (MSE: {train_avg:.2f} ± {train_std:.2f})"
+    # )
+    # print(f"Val RMSE: {val_rmse_avg:.2f}±{val_rmse_std:.2f} (MSE: {val_avg:.2f} ± {val_std:.2f})")
+    # print(
+    #     f"Test RMSE: {test_rmse_avg:.2f}±{test_rmse_std:.2f} (MSE: {test_avg:.2f} ± {test_std:.2f})"
+    # )
+
+    logger.success("Model:\n{}", model)
+    logger.success(
+        f"Test RMSE: {test_rmse_avg:.2f}±{test_rmse_std:.2f} (MSE: {test_avg:.2f} ± {test_std:.2f})"
+    )
+
+    # from torchinfo import summary
+
+    # model is already .to(device)
+    # X_dummy = torch.randn(1, T, Din, device=device)  # CUDA
+    # lengths_dummy = torch.tensor([T], dtype=torch.long)  # CPU
+
+    # summary(
+    #     model,
+    #     input_data=(X_dummy, lengths_dummy),
+    #     device=None,  # <- IMPORTANT: don't let torchinfo move inputs
+    # )
+
+    # from loguru import logger
+
+    # logger.warning
 
 
 # ----------------------------
@@ -378,15 +428,15 @@ if __name__ == "__main__":
         out_dir="models/exp_simple_gru_cv_es",
         batch_size=128,  # 64,
         hidden_size=64,
-        num_layers=1,  #! try 2 or 3 layers too
+        num_layers=3,  #! try 2 or 3 layers too
         dropout=0.0,
         bidirectional=False,
         fc_hidden=64,  # set None to use a single Linear
-        epochs=10,  # upper bound; early stopping will usually stop sooner
+        epochs=500,  # upper bound; early stopping will usually stop sooner
         lr=3e-4,
         seed=42,
         concat_XM=True,  # feed [X||M]; recommended when zeros denote missing
         val_frac=0.1,  # 10% of outer-train becomes inner-val
-        patience=5,  # stop if no val improvement for 5 epochs
+        patience=30,  # stop if no val improvement for 5 epochs
         cv=5,  # 5-fold cross-validation
     )
