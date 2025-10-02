@@ -1,81 +1,284 @@
+# retain.py
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable
 from pathlib import Path
 
 import numpy as np
 import torch
 from loguru import logger
-from torch import nn
+from torch import Tensor, nn
 from torch.utils.data import DataLoader, Subset
 
-# If these live elsewhere, adjust imports accordingly
 from src.modeling.ragged_timeseries import TimeSeriesDataset, collate_grud
 
+# If these live elsewhere, adjust imports accordingly
+
+
+# Your project loaders/collate (same as in grud.py)
+
 
 # ----------------------------
-# 1) Simple GRU Regressor
+# Utilities
 # ----------------------------
-class SimpleGRURegressor(nn.Module):
+def lengths_to_mask(lengths: Tensor, T: int) -> Tensor:
+    """(B,) -> (B,T) bool where True = valid timestep."""
+    device = lengths.device
+    rng = torch.arange(T, device=device).unsqueeze(0)  # (1,T)
+    return rng < lengths.unsqueeze(1)  # (B,T)
+
+
+def masked_mean(x: Tensor, mask: Tensor, dim: int) -> Tensor:
     """
-    Minimal GRU regressor:
-      - Input: (B, T, Din)
-      - Uses pack_padded_sequence with 'lengths'
-      - Output: scalar yhat per sequence
+    x:    (B,T,D)
+    mask: (B,T) bool (True for valid)
+    returns: (B,D) mean over valid positions; 0 if none valid.
+    """
+    m = mask.unsqueeze(-1).type_as(x)  # (B,T,1)
+    num = (x * m).sum(dim=dim)  # (B,D)
+    den = m.sum(dim=dim).clamp_min(1e-8)  # (B,1)->(B,D) via broadcast
+    return num / den
+
+
+def last_valid(x: Tensor, lengths: Tensor) -> Tensor:
+    """
+    x: (B,T,D), lengths: (B,)
+    returns (B,D) picking x[b, lengths[b]-1]
+    """
+    B, T, D = x.shape
+    idx = (lengths - 1).clamp_min(0).view(B, 1, 1).expand(B, 1, D)  # (B,1,D)
+    return x.gather(1, idx).squeeze(1)  # (B,D)
+
+
+# ----------------------------
+# Positional / time encodings
+# ----------------------------
+
+
+class SinusoidalPositionalEncoding(nn.Module):
+    """
+    Standard transformer positional encoding (index-based).
+    Produces (B,T,D) given T and d_model, then adds to token embeddings.
+    """
+
+    def __init__(self, d_model: int, max_len: int = 4096, dropout: float = 0.0):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+
+        pe = torch.zeros(max_len, d_model)  # (T,D)
+        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2, dtype=torch.float32) * (-math.log(10000.0) / d_model)
+        )
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe)  # (max_len, D)
+
+    def forward(self, x: Tensor) -> Tensor:
+        # x: (B,T,D)
+        T = x.size(1)
+        x = x + self.pe[:T].unsqueeze(0).to(x.dtype)  # (1,T,D)
+        return self.dropout(x)
+
+
+class ContinuousTimeEncoding(nn.Module):
+    """
+    Continuous-time sinusoidal encoding using cumulative time stamps (sum of DT).
+    - dt: (B,T)  time gaps; first step can be 0.
+    Enc(t) = [sin(w_k * tau_t), cos(w_k * tau_t)]_k with tau_t = cumsum(dt).
+    """
+
+    def __init__(self, d_model: int, dropout: float = 0.0):
+        super().__init__()
+        # We create D frequencies; if D is odd, last cos slice will be shorter (fine).
+        self.d_model = d_model
+        self.dropout = nn.Dropout(dropout)
+        # frequency basis like transformer positional but applied to tau
+        self.register_buffer(
+            "freq",
+            torch.exp(
+                torch.arange(0, d_model, 2, dtype=torch.float32) * (-math.log(10000.0) / d_model)
+            ),
+        )  # (⌈D/2⌉,)
+
+    def forward(self, x: Tensor, dt: Tensor) -> Tensor:
+        """
+        x:  (B,T,D)
+        dt: (B,T)
+        returns x + f(tau) with tau = cumsum(dt) along time.
+        """
+        tau = torch.cumsum(dt, dim=1)  # (B,T)
+        # build sinusoidal embedding at runtime to match batch T
+        B, T, D = x.shape
+        freq = self.freq.to(x.device)  # (F,)
+        # (B,T,1)*(1,1,F) -> (B,T,F)
+        arg = tau.unsqueeze(-1) * freq.view(1, 1, -1)
+        pe = torch.zeros(B, T, D, device=x.device, dtype=x.dtype)
+        pe[:, :, 0::2] = torch.sin(arg)
+        pe[:, :, 1::2] = torch.cos(arg)
+        return self.dropout(x + pe)
+
+
+# ----------------------------
+# Time-Series Transformer
+# ----------------------------
+
+
+class TimeSeriesTransformerRegressor(nn.Module):
+    """
+    A clean Transformer encoder for ragged multivariate time series.
+
+    Forward:
+        y_hat = model(X, M, DT, lengths)
+
+    Options:
+      - concat_XM:   feed [X||M] (explicit missingness)
+      - use_dt_feat: append DT as a channel to inputs
+      - pos_encoding: 'sinusoidal' (index-based) or 'continuous' (uses DT cumsum)
+      - pooling: 'mean' | 'last' | 'cls'
     """
 
     def __init__(
         self,
-        input_size: int,
-        hidden_size: int = 64,
-        num_layers: int = 1,
-        dropout: float = 0.0,
-        bidirectional: bool = False,
-        fc_hidden: int | None = None,
+        input_size: int,  # D (or D*2 if concat_XM handled externally)
+        d_model: int = 128,  # must be divisible by nhead
+        nhead: int = 8,
+        num_layers: int = 4,
+        dim_feedforward: int = 256,
+        dropout: float = 0.1,
+        *,
+        concat_XM: bool = False,
+        use_dt_feat: bool = False,  # append DT as 1 more channel
+        pos_encoding: Literal[sinusoidal, continuous] = "sinusoidal",
+        pooling: Literal[mean, last, cls] = "mean",
+        max_len: int = 4096,
+        head_hidden: int = 64,
     ):
         super().__init__()
-        self.gru = nn.GRU(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0.0,
-            bidirectional=bidirectional,
-        )
-        out_h = hidden_size * (2 if bidirectional else 1)
+        assert d_model % nhead == 0, "d_model must be divisible by nhead"
+        self.concat_XM = concat_XM
+        self.use_dt_feat = use_dt_feat
+        self.pooling = pooling
+        self.pos_encoding_type = pos_encoding
 
-        if fc_hidden is None:
-            self.head = nn.Linear(out_h, 1)
+        in_dim = input_size + (1 if use_dt_feat else 0)
+
+        # Optional CLS token
+        self.use_cls = pooling == "cls"
+        if self.use_cls:
+            self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))  # (1,1,D)
+
+        # Project inputs to model dimension
+        self.in_proj = nn.Linear(in_dim, d_model)
+        self.in_drop = nn.Dropout(dropout)
+
+        # Positional encodings
+        if pos_encoding == "sinusoidal":
+            self.posenc = SinusoidalPositionalEncoding(d_model, max_len=max_len, dropout=dropout)
+            self.ctenc = None
+        elif pos_encoding == "continuous":
+            self.posenc = None
+            self.ctenc = ContinuousTimeEncoding(d_model, dropout=dropout)
         else:
-            self.head = nn.Sequential(
-                nn.Linear(out_h, fc_hidden),
-                nn.ReLU(),
-                nn.Linear(fc_hidden, 1),
-            )
+            raise ValueError("pos_encoding must be 'sinusoidal' or 'continuous'")
 
-    def forward(self, X: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
-        """
-        X: (B, T, Din)
-        lengths: (B,) int64 lengths (descending order not required; enforce_sorted=False)
-        """
-        # Sanity check (remove after debugging for speed)
-        # assert lengths.device.type == "cpu", f"lengths on {lengths.device}, expected cpu"
-        packed = nn.utils.rnn.pack_padded_sequence(
-            X,
-            lengths,
+        # Transformer encoder (batch_first=True)
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
             batch_first=True,
-            enforce_sorted=False,
-            # enforce_sorted=True,
+            activation="gelu",
+            norm_first=True,
         )
-        _, h_n = self.gru(packed)  # h_n: (num_layers * num_directions, B, H)
-        last = h_n[-1]  # final layer, last direction → (B, Hout)
-        yhat = self.head(last).squeeze(-1)  # (B,)
-        return yhat
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+
+        # Regression head
+        self.head = nn.Sequential(
+            nn.Linear(d_model, head_hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(head_hidden, 1),
+        )
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5))
+                if m.bias is not None:
+                    fan_in, _ = nn.init._calculate_fan_in_and_fan_out(m.weight)
+                    bound = 1 / math.sqrt(fan_in)
+                    nn.init.uniform_(m.bias, -bound, bound)
+        if self.use_cls:
+            nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
+
+    def _build_inputs(self, X: Tensor, M: Tensor, DT: Tensor) -> Tensor:
+        """
+        Optionally concat mask and/or DT, then project to d_model.
+        """
+        feats = [X]
+        if self.concat_XM:
+            feats.append(M)
+        if self.use_dt_feat:
+            feats.append(DT.unsqueeze(-1))  # (B,T,1)
+        Xin = torch.cat(feats, dim=-1)  # (B,T,in_dim)
+        return self.in_drop(self.in_proj(Xin))  # (B,T,D)
+
+    def forward(self, X: Tensor, M: Tensor, DT: Tensor, lengths: Tensor) -> Tensor:
+        """
+        X: (B,T,D), M: (B,T,D) 0/1, DT: (B,T), lengths: (B,)
+        returns: (B,)
+        """
+        B, T, _ = X.shape
+        key_padding_mask = ~lengths_to_mask(lengths, T)  # (B,T) True for PAD
+
+        h = self._build_inputs(X, M, DT)  # (B,T,D_model)
+
+        # Positional / time encoding
+        if self.pos_encoding_type == "sinusoidal":
+            h = self.posenc(h)  # adds index-based PE
+        else:
+            h = self.ctenc(h, DT)  # adds continuous-time PE
+
+        # Optional CLS token
+        if self.use_cls:
+            cls = self.cls_token.expand(B, -1, -1)  # (B,1,D)
+            h = torch.cat([cls, h], dim=1)  # (B,1+T,D)
+            # pad mask grows with a valid CLS at position 0
+            pad = torch.zeros(B, 1, dtype=torch.bool, device=h.device)
+            key_padding_mask = torch.cat([pad, key_padding_mask], dim=1)  # (B,1+T)
+
+        # Encode
+        h = self.encoder(h, src_key_padding_mask=key_padding_mask)  # (B,1+T,D) or (B,T,D)
+
+        # Pool to a single vector
+        if self.pooling == "cls":
+            pooled = h[:, 0, :]  # (B,D)
+        elif self.pooling == "last":
+            # if CLS not used, sequences start at idx 0; otherwise last valid index shifts by +1
+            if self.use_cls:
+                pooled = last_valid(h[:, 1:, :], lengths)  # ignore CLS for last-valid
+            else:
+                pooled = last_valid(h, lengths)
+        else:  # 'mean'
+            if self.use_cls:
+                pooled = masked_mean(h[:, 1:, :], ~key_padding_mask[:, 1:], dim=1)
+            else:
+                pooled = masked_mean(h, ~key_padding_mask, dim=1)
+
+        y_hat = self.head(pooled).squeeze(-1)  # (B,)
+        return y_hat
 
 
 # ----------------------------
 # 2) Helpers
 # ----------------------------
+
+
 def set_seed(seed: int = 42):
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -84,16 +287,16 @@ def set_seed(seed: int = 42):
 def batch_to_device(
     batch: dict[str, torch.Tensor], device: torch.device
 ) -> dict[str, torch.Tensor]:
-    # return {k: v.to(device) for k, v in batch.items()}
-    out = {}
-    for k, v in batch.items():
-        if k == "lengths":
-            out[k] = v  # keep on CPU for pack_padded_sequence
-        elif torch.is_tensor(v):
-            out[k] = v.to(device, non_blocking=True)
-        else:
-            out[k] = v
-    return out
+    return {k: v.to(device) for k, v in batch.items()}
+    # out = {}
+    # for k, v in batch.items():
+    #     if k == "lengths":
+    #         out[k] = v  # keep on CPU for pack_padded_sequence
+    #     elif torch.is_tensor(v):
+    #         out[k] = v.to(device, non_blocking=True)
+    #     else:
+    #         out[k] = v
+    # return out
 
 
 def make_loader(ds, idxs: Iterable[int], batch_size: int, shuffle: bool) -> DataLoader:
@@ -141,7 +344,7 @@ def split_train_val(idxs: np.ndarray, val_frac: float = 0.1, seed: int = 42):
 
 
 # ----------------------------
-# 3) Train / Eval (with optional X||M)
+# 3) Train / Eval
 # ----------------------------
 def train_one_epoch(
     model: nn.Module,
@@ -149,19 +352,19 @@ def train_one_epoch(
     optim: torch.optim.Optimizer,
     device: torch.device,
     *,
-    concat_XM: bool = True,
+    concat_XM: bool = False,
 ):
     model.train()
     total = 0.0
     n = 0
     for batch in loader:
         batch = batch_to_device(batch, device)
-        X, M, lengths, y = batch["X"], batch["M"], batch["lengths"], batch["y"]
+        X, M, DT, lengths, y = batch["X"], batch["M"], batch["DT"], batch["lengths"], batch["y"]
 
-        X_in = torch.cat([X, M], dim=-1) if concat_XM else X
+        # X_in = torch.cat([X, M], dim=-1) if concat_XM else X
 
         optim.zero_grad()
-        yhat = model(X_in, lengths)
+        yhat = model(X, M, DT, lengths)
         loss = nn.functional.mse_loss(yhat, y)
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -179,16 +382,15 @@ def evaluate(
     loader: DataLoader,
     device: torch.device,
     *,
-    concat_XM: bool = True,
+    concat_XM: bool = False,
 ):
     model.eval()
     total = 0.0
     n = 0
     for batch in loader:
         batch = batch_to_device(batch, device)
-        X, M, lengths, y = batch["X"], batch["M"], batch["lengths"], batch["y"]
-        X_in = torch.cat([X, M], dim=-1) if concat_XM else X
-        yhat = model(X_in, lengths)
+        X, M, DT, lengths, y = batch["X"], batch["M"], batch["DT"], batch["lengths"], batch["y"]
+        yhat = model(X, M, DT, lengths)
         loss = nn.functional.mse_loss(yhat, y)
         bs = X.size(0)
         total += loss.item() * bs
@@ -201,7 +403,7 @@ def evaluate(
 # ----------------------------
 def run_k_fold_cv_earlystop(
     pkl_path: str = "data/processed/COPD_PATIENTS_DATA.pkl",
-    out_dir: str = "models/exp_simple_gru_cv_es",
+    out_dir: str = "models/exp_GRU_D_cv_es",
     *,
     batch_size: int = 64,
     hidden_size: int = 64,
@@ -212,7 +414,7 @@ def run_k_fold_cv_earlystop(
     epochs: int = 100,
     lr: float = 3e-4,
     seed: int = 42,
-    concat_XM: bool = True,  # True → feed [X||M]; False → only X
+    concat_XM: bool = False,  # True → feed [X||M]; False → only X
     val_frac: float = 0.1,  # inner validation fraction from outer-train
     patience: int = 5,  # early stopping patience on val MSE
     cv: int = 5,  # number of outer folds
@@ -266,14 +468,20 @@ def run_k_fold_cv_earlystop(
         test_loader = make_loader(ds, test_idx, batch_size=batch_size, shuffle=False)
 
         # Model / Optim
-        model = SimpleGRURegressor(
-            input_size=Din,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            dropout=dropout,
-            bidirectional=bidirectional,
-            fc_hidden=fc_hidden,
+        model = TimeSeriesTransformerRegressor(
+            input_size=Din,  # Din = D or D*2 if you set concat_XM=True in your loop
+            d_model=128,  # must be divisible by nhead
+            nhead=8,
+            num_layers=4,
+            dim_feedforward=256,
+            dropout=0.1,
+            concat_XM=concat_XM,  # keep in sync with how you compute Din
+            use_dt_feat=False,  # set True to append DT as a channel
+            pos_encoding="continuous",  # "sinusoidal" or "continuous" (uses DT cumsum)
+            pooling="mean",  # "mean" | "last" | "cls"
+            head_hidden=64,
         ).to(device)
+
         optim = torch.optim.Adam(model.parameters(), lr=lr)
 
         # Early stopping bookkeeping
@@ -423,19 +631,41 @@ def run_k_fold_cv_earlystop(
 # 5) CLI entry
 # ----------------------------
 if __name__ == "__main__":
+    # install()
+    # import pretty_errors
+
+    # # # `configure` can be omitted if you're satisfied with default settings
+    # # pretty_errors.configure()
+    # pretty_errors.configure(
+    #     filename_display=pretty_errors.FILENAME_EXTENDED,
+    #     line_number_first=True,
+    #     display_link=True,
+    #     line_color=pretty_errors.RED + "> " + pretty_errors.default_config.line_color,
+    #     code_color="  " + pretty_errors.default_config.line_color,
+    #     truncate_code=True,
+    #     display_locals=True,
+    # )
+
+    # import better_exceptions
+
+    # better_exceptions.MAX_LENGTH = None
+    # # Check if you TERM variable is set to `xterm`, if not set below variable - https://github.com/Qix-/better-exceptions/issues/8
+    # better_exceptions.SUPPORTS_COLOR = True
+    # better_exceptions.hook()
+
     run_k_fold_cv_earlystop(
         pkl_path="data/processed/COPD_PATIENTS_DATA.pkl",
-        out_dir="models/exp_simple_gru_cv_es",
+        out_dir="models/exp_tstransformer_cv_es",
         batch_size=128,  # 64,
         hidden_size=64,
         num_layers=2,  #! try 2 or 3 layers too
-        dropout=0.4,
+        dropout=0.1,
         bidirectional=False,
         fc_hidden=64,  # set None to use a single Linear
         epochs=500,  # upper bound; early stopping will usually stop sooner
         lr=3e-4,
         seed=42,
-        concat_XM=True,  # feed [X||M]; recommended when zeros denote missing
+        concat_XM=False,  # feed [X||M]; recommended when zeros denote missing
         val_frac=0.1,  # 10% of outer-train becomes inner-val
         patience=30,  # stop if no val improvement for 5 epochs
         cv=5,  # 5-fold cross-validation

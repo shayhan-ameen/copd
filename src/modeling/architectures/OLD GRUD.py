@@ -8,8 +8,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from loguru import logger
-
-# from rich.traceback import install, import pretty_errors, import better_exceptions
+from rich.traceback import install
 from torch import Tensor, nn
 from torch.nn.utils.rnn import PackedSequence, pack_padded_sequence, pad_packed_sequence
 from torch.utils.data import DataLoader, Subset
@@ -267,20 +266,13 @@ class GRUD(nn.Module):
 
             in_t = x_t
             for l, cell in enumerate(self.layers):
-                # h[l] = cell(
-                #     in_t,
-                #     m_t if l == 0 else torch.ones_like(m_t),
-                #     dx_t if l == 0 else torch.zeros_like(dx_t),
-                #     dh_t,
-                #     h[l],
-                # )
-
-                # For layer 0, use real mask/deltas over features (D).
-                # For higher layers, use ones/zeros matching the current layer input (H).
-                m_l = m_t if l == 0 else torch.ones_like(in_t)  # (B, D) or (B, H)
-                dx_l = dx_t if l == 0 else torch.zeros_like(in_t)
-                h[l] = cell(in_t, m_l, dx_l, dh_t, h[l])
-
+                h[l] = cell(
+                    in_t,
+                    m_t if l == 0 else torch.ones_like(m_t),
+                    dx_t if l == 0 else torch.zeros_like(dx_t),
+                    dh_t,
+                    h[l],
+                )
                 # keep hidden for valid sequences only
                 h[l] = valid * h[l] + (1 - valid) * h[l].detach()  # freeze past end
                 in_t = h[l]  # next layer input
@@ -451,13 +443,7 @@ def train_one_epoch(
 
 
 @torch.no_grad()
-def evaluate(
-    model: nn.Module,
-    loader: DataLoader,
-    device: torch.device,
-    *,
-    concat_XM: bool = False,
-):
+def evaluate(model: nn.Module, loader: DataLoader, device: torch.device):
     model.eval()
     total = 0.0
     n = 0
@@ -707,34 +693,13 @@ def run_k_fold_cv_earlystop(
 # 5) CLI entry
 # ----------------------------
 if __name__ == "__main__":
-    # install()
-    import pretty_errors
-
-    # # `configure` can be omitted if you're satisfied with default settings
-    # pretty_errors.configure()
-    pretty_errors.configure(
-        filename_display=pretty_errors.FILENAME_EXTENDED,
-        line_number_first=True,
-        display_link=True,
-        line_color=pretty_errors.RED + "> " + pretty_errors.default_config.line_color,
-        code_color="  " + pretty_errors.default_config.line_color,
-        truncate_code=True,
-        display_locals=True,
-    )
-
-    # import better_exceptions
-
-    # better_exceptions.MAX_LENGTH = None
-    # # Check if you TERM variable is set to `xterm`, if not set below variable - https://github.com/Qix-/better-exceptions/issues/8
-    # better_exceptions.SUPPORTS_COLOR = True
-    # better_exceptions.hook()
-
+    install()
     run_k_fold_cv_earlystop(
         pkl_path="data/processed/COPD_PATIENTS_DATA.pkl",
-        out_dir="models/exp_GRU_D_cv_es",
+        out_dir="models/exp_simple_gru_cv_es",
         batch_size=128,  # 64,
         hidden_size=64,
-        num_layers=3,  #! try 2 or 3 layers too
+        num_layers=5,  #! try 2 or 3 layers too
         dropout=0.4,
         bidirectional=False,
         fc_hidden=64,  # set None to use a single Linear

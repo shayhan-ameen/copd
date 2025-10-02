@@ -115,9 +115,10 @@ def train_main(
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
-    ds = TimeSeriesDataset(
-        pkl_path, include_age=True, include_gender=False, include_dt_feature=False
-    )
+    # ds = TimeSeriesDataset(
+    #     pkl_path, include_age=True, include_gender=False, include_dt_feature=False
+    # )
+    ds = TimeSeriesDataset(compute=False)
 
     # with open("data/processed/COPDGRUDDataset.pkl", "wb") as f:
     #     pickle.dump(ds, f, protocol=pickle.HIGHEST_PROTOCOL)

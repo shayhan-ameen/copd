@@ -15,6 +15,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+    #! number of visits distribution: Median 4, 70th percentile 6, 90th percentile 11, 95th percentile 15
     # ! SpiroUtils integrates the patient’s demographic information (age, gender, height) to calculate the Predicted Value and Z-score for these metrics based on the multi-ethnic reference equations published by the Global Lung Function Initiative in 2012. [Quanjer, P.H., Stanojevic, S., Cole, T.J., Baur, X., Hall, G.L., Culver, B.H., Enright, P.L., Hankinson, J.L., Ip, M.S., Zheng, J. et al. (2012). Multi-ethnic reference values for spirometry for the 3–95-yr age range: the global lung function 2012 equations. European Respiratory Society.]
     # !    Compute Pred, %Pred, z-scores via GLI-2012 (sex, age, height) for FEV₁/FVC/FEF25–75.
     # !    Retrieve GOLD rules relevant to each case (diagnosis threshold, severity).

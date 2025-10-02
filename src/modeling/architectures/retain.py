@@ -1,81 +1,255 @@
+# retain.py
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable
 from pathlib import Path
 
 import numpy as np
 import torch
 from loguru import logger
-from torch import nn
+from torch import Tensor, nn
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from torch.utils.data import DataLoader, Subset
 
-# If these live elsewhere, adjust imports accordingly
 from src.modeling.ragged_timeseries import TimeSeriesDataset, collate_grud
 
+# If these live elsewhere, adjust imports accordingly
+
+
+# Your project loaders/collate (same as in grud.py)
 
 # ----------------------------
-# 1) Simple GRU Regressor
+# Utilities
 # ----------------------------
-class SimpleGRURegressor(nn.Module):
+
+
+def lengths_to_mask(lengths: Tensor, T: int) -> Tensor:
     """
-    Minimal GRU regressor:
-      - Input: (B, T, Din)
-      - Uses pack_padded_sequence with 'lengths'
-      - Output: scalar yhat per sequence
+    lengths: (B,)  int
+    returns: (B, T) bool mask, True for valid positions [0..len-1]
+    """
+    device = lengths.device
+    rng = torch.arange(T, device=device).unsqueeze(0)  # (1,T)
+    return rng < lengths.unsqueeze(1)  # (B,T)
+
+
+def reverse_padded(x: Tensor, lengths: Tensor) -> Tensor:
+    """
+    Reverse each sequence along time for the first 'length' steps; keep the padded
+    region at the end. Works for any trailing shape.
+      x:       (B, T, ...)
+      lengths: (B,)
+    returns:   (B, T, ...)
+    """
+    B, T = x.size(0), x.size(1)
+    idx_range = torch.arange(T, device=x.device).unsqueeze(0).expand(B, T)  # (B,T)
+    # For valid timesteps t < len: map to (len-1 - t); else keep t
+    rev_idx = (lengths.unsqueeze(1) - 1 - idx_range).clamp_min(0)
+    rev_idx = torch.where(idx_range < lengths.unsqueeze(1), rev_idx, idx_range)  # (B,T)
+    # Expand rev_idx to match x's trailing dims for gather
+    gather_idx = rev_idx.view(B, T, *([1] * (x.dim() - 2))).expand_as(x)
+    return x.gather(dim=1, index=gather_idx)
+
+
+def masked_softmax(logits: Tensor, mask: Tensor, dim: int = -1, eps: float = 1e-9) -> Tensor:
+    """
+    logits: (B, T)
+    mask:   (B, T) boolean; False positions are ignored
+    returns normalized probabilities over valid positions (sum to 1 per row with any True).
+    If a row has no True, returns all zeros for that row.
+    """
+    # Put very negative where mask is False
+    neg_inf = torch.finfo(logits.dtype).min
+    masked = torch.where(
+        mask, logits, torch.tensor(neg_inf, device=logits.device, dtype=logits.dtype)
+    )
+    # For rows with all False, softmax would be NaN → guard by replacing with zeros after
+    alphas = torch.softmax(masked, dim=dim)
+    alphas = torch.where(mask, alphas, torch.zeros_like(alphas))
+    # Re-normalize each row to sum 1 over valid entries (if any valid)
+    denom = alphas.sum(dim=dim, keepdim=True).clamp_min(eps)
+    return alphas / denom
+
+
+# ----------------------------
+# RETAIN core
+# ----------------------------
+
+
+class RETAINRegressor(nn.Module):
+    """
+    RETAIN (Choi et al. 2016) adapted for continuous multivariate time series.
+
+    Forward contract (drop-in for your loops):
+        y_hat = model(X, M, DT, lengths)
+      where:
+        X:       (B, T, D)  padded inputs (use zeros for missing)
+        M:       (B, T, D)  binary mask 1=observed, 0=missing (optional; see concat_XM)
+        DT:      (B, T)     unused here (kept for signature parity)
+        lengths: (B,)       actual sequence lengths
+
+    Key steps:
+      1) Reverse-time processing.
+      2) Build per-step embeddings e_t = tanh(W_e x_t).
+      3) Two GRUs over reversed e: one for α-weights (attention over time),
+         one for β-vectors (feature-wise importance).
+      4) α = softmax(w_α^T h_α); β = tanh(W_β h_β).
+      5) Context c = Σ_t α_t * (β_t ⊙ e_t).
+      6) Regress y from c via an MLP head.
     """
 
     def __init__(
         self,
-        input_size: int,
-        hidden_size: int = 64,
-        num_layers: int = 1,
-        dropout: float = 0.0,
-        bidirectional: bool = False,
-        fc_hidden: int | None = None,
+        input_size: int,  # D (or D*2 if you plan to pass [X||M])
+        emb_size: int = 128,  # size of per-step embedding e_t
+        attn_hidden: int = 64,  # hidden for α-GRU and β-GRU
+        head_hidden: int = 64,  # MLP hidden for the regression head
+        dropout: float = 0.1,
+        concat_XM: bool = False,  # if True, we'll internally concat [X||M]
     ):
         super().__init__()
-        self.gru = nn.GRU(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0.0,
-            bidirectional=bidirectional,
-        )
-        out_h = hidden_size * (2 if bidirectional else 1)
+        self.concat_XM = concat_XM
+        self.input_size = input_size
+        self.emb_size = emb_size
+        self.attn_hidden = attn_hidden
 
-        if fc_hidden is None:
-            self.head = nn.Linear(out_h, 1)
+        # Step embedding
+        self.emb = nn.Linear(input_size, emb_size)
+        self.emb_act = nn.Tanh()
+        self.emb_dropout = nn.Dropout(dropout)
+
+        # Two GRUs run on reversed sequence (packed)
+        self.alpha_rnn = nn.GRU(emb_size, attn_hidden, batch_first=True)
+        self.beta_rnn = nn.GRU(emb_size, attn_hidden, batch_first=True)
+
+        # α and β projections
+        self.alpha_fc = nn.Linear(attn_hidden, 1)  # → scalar per step
+        self.beta_fc = nn.Linear(attn_hidden, emb_size)  # → vector per step
+        self.beta_act = nn.Tanh()
+
+        # Regression head from context vector
+        self.head = nn.Sequential(
+            nn.Linear(emb_size, head_hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(head_hidden, 1),
+        )
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5))
+                if m.bias is not None:
+                    fan_in, _ = nn.init._calculate_fan_in_and_fan_out(m.weight)
+                    bound = 1 / math.sqrt(fan_in)
+                    nn.init.uniform_(m.bias, -bound, bound)
+
+    def _pack_sort(self, x: Tensor, lengths: Tensor):
+        lengths_sorted, sort_idx = lengths.sort(descending=True)
+        x_sorted = x.index_select(0, sort_idx)
+        packed = pack_padded_sequence(
+            x_sorted, lengths_sorted.cpu(), batch_first=True, enforce_sorted=True
+        )
+        inv_idx = torch.empty_like(sort_idx)
+        inv_idx[sort_idx] = torch.arange(sort_idx.size(0), device=sort_idx.device)
+        return packed, sort_idx, inv_idx, lengths_sorted
+
+    def forward(self, X: Tensor, M: Tensor, DT: Tensor, lengths: Tensor) -> Tensor:
+        # Optionally concatenate mask as features
+        if self.concat_XM:
+            Xin = torch.cat([X, M], dim=-1)  # (B,T,D*2)
         else:
-            self.head = nn.Sequential(
-                nn.Linear(out_h, fc_hidden),
-                nn.ReLU(),
-                nn.Linear(fc_hidden, 1),
-            )
+            Xin = X  # (B,T,D)
 
-    def forward(self, X: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        B, T, _ = Xin.shape
+        device = Xin.device
+
+        # Per-step embedding
+        e = self.emb_act(self.emb(Xin))  # (B,T,E)
+        e = self.emb_dropout(e)
+
+        # Reverse time; build valid-time masks for softmax later
+        time_mask = lengths_to_mask(lengths, T)  # (B,T) bool
+        e_rev = reverse_padded(e, lengths)  # (B,T,E)
+        mask_rev = reverse_padded(time_mask.float(), lengths).bool()  # (B,T)
+
+        # Pack (need to sort by length)
+        packed_e, sort_idx, unsort_idx, lengths_sorted = self._pack_sort(e_rev, lengths)
+
+        # RNNs (alpha and beta)
+        alpha_out_packed, _ = self.alpha_rnn(packed_e)  # packed
+        beta_out_packed, _ = self.beta_rnn(packed_e)
+
+        # Unpack back to padded sequences (B_sorted, Tmax, H)
+        alpha_out, _ = pad_packed_sequence(alpha_out_packed, batch_first=True, total_length=T)
+        beta_out, _ = pad_packed_sequence(beta_out_packed, batch_first=True, total_length=T)
+
+        # Restore original batch order
+        alpha_out = alpha_out.index_select(0, unsort_idx)  # (B,T,H_a)
+        beta_out = beta_out.index_select(0, unsort_idx)  # (B,T,H_b)
+
+        # α logits per step (on reversed time)
+        alpha_logits = self.alpha_fc(alpha_out).squeeze(-1)  # (B,T)
+        # Masked softmax over time (reversed axis)
+        alpha = masked_softmax(alpha_logits, mask_rev, dim=1)  # (B,T)
+
+        # β vectors per step
+        beta = self.beta_act(self.beta_fc(beta_out))  # (B,T,E)
+
+        # Context: c = Σ_t α_t * (β_t ⊙ e_t)  (all in reversed-time alignment)
+        attn_term = beta * e_rev  # (B,T,E)
+        c = torch.sum(alpha.unsqueeze(-1) * attn_term, dim=1)  # (B,E)
+
+        # Regression
+        y_hat = self.head(c).squeeze(-1)  # (B,)
+        return y_hat
+
+    @torch.no_grad()
+    def forward_with_attention(
+        self, X: Tensor, M: Tensor, DT: Tensor, lengths: Tensor
+    ) -> tuple[Tensor, Tensor]:
         """
-        X: (B, T, Din)
-        lengths: (B,) int64 lengths (descending order not required; enforce_sorted=False)
+        Returns (y_hat, alpha) where alpha is the reverse-time attention over steps (B,T).
+        Useful for inspecting which timesteps mattered.
         """
-        # Sanity check (remove after debugging for speed)
-        # assert lengths.device.type == "cpu", f"lengths on {lengths.device}, expected cpu"
-        packed = nn.utils.rnn.pack_padded_sequence(
-            X,
-            lengths,
-            batch_first=True,
-            enforce_sorted=False,
-            # enforce_sorted=True,
-        )
-        _, h_n = self.gru(packed)  # h_n: (num_layers * num_directions, B, H)
-        last = h_n[-1]  # final layer, last direction → (B, Hout)
-        yhat = self.head(last).squeeze(-1)  # (B,)
-        return yhat
+        if self.concat_XM:
+            Xin = torch.cat([X, M], dim=-1)
+        else:
+            Xin = X
+
+        B, T, _ = Xin.shape
+        e = self.emb_act(self.emb(Xin))
+        time_mask = lengths_to_mask(lengths, T)
+        e_rev = reverse_padded(e, lengths)
+        mask_rev = reverse_padded(time_mask.float(), lengths).bool()
+
+        packed_e, sort_idx, unsort_idx, _ = self._pack_sort(e_rev, lengths)
+        alpha_out_packed, _ = self.alpha_rnn(packed_e)
+        beta_out_packed, _ = self.beta_rnn(packed_e)
+
+        alpha_out, _ = pad_packed_sequence(alpha_out_packed, batch_first=True, total_length=T)
+        beta_out, _ = pad_packed_sequence(beta_out_packed, batch_first=True, total_length=T)
+
+        alpha_out = alpha_out.index_select(0, unsort_idx)
+        beta_out = beta_out.index_select(0, unsort_idx)
+
+        alpha_logits = self.alpha_fc(alpha_out).squeeze(-1)
+        alpha = masked_softmax(alpha_logits, mask_rev, dim=1)
+
+        beta = self.beta_act(self.beta_fc(beta_out))
+        c = torch.sum(alpha.unsqueeze(-1) * (beta * e_rev), dim=1)
+        y_hat = self.head(c).squeeze(-1)
+        return y_hat, alpha
 
 
 # ----------------------------
 # 2) Helpers
 # ----------------------------
+
+
 def set_seed(seed: int = 42):
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -84,16 +258,16 @@ def set_seed(seed: int = 42):
 def batch_to_device(
     batch: dict[str, torch.Tensor], device: torch.device
 ) -> dict[str, torch.Tensor]:
-    # return {k: v.to(device) for k, v in batch.items()}
-    out = {}
-    for k, v in batch.items():
-        if k == "lengths":
-            out[k] = v  # keep on CPU for pack_padded_sequence
-        elif torch.is_tensor(v):
-            out[k] = v.to(device, non_blocking=True)
-        else:
-            out[k] = v
-    return out
+    return {k: v.to(device) for k, v in batch.items()}
+    # out = {}
+    # for k, v in batch.items():
+    #     if k == "lengths":
+    #         out[k] = v  # keep on CPU for pack_padded_sequence
+    #     elif torch.is_tensor(v):
+    #         out[k] = v.to(device, non_blocking=True)
+    #     else:
+    #         out[k] = v
+    # return out
 
 
 def make_loader(ds, idxs: Iterable[int], batch_size: int, shuffle: bool) -> DataLoader:
@@ -141,7 +315,7 @@ def split_train_val(idxs: np.ndarray, val_frac: float = 0.1, seed: int = 42):
 
 
 # ----------------------------
-# 3) Train / Eval (with optional X||M)
+# 3) Train / Eval
 # ----------------------------
 def train_one_epoch(
     model: nn.Module,
@@ -149,19 +323,19 @@ def train_one_epoch(
     optim: torch.optim.Optimizer,
     device: torch.device,
     *,
-    concat_XM: bool = True,
+    concat_XM: bool = False,
 ):
     model.train()
     total = 0.0
     n = 0
     for batch in loader:
         batch = batch_to_device(batch, device)
-        X, M, lengths, y = batch["X"], batch["M"], batch["lengths"], batch["y"]
+        X, M, DT, lengths, y = batch["X"], batch["M"], batch["DT"], batch["lengths"], batch["y"]
 
-        X_in = torch.cat([X, M], dim=-1) if concat_XM else X
+        # X_in = torch.cat([X, M], dim=-1) if concat_XM else X
 
         optim.zero_grad()
-        yhat = model(X_in, lengths)
+        yhat = model(X, M, DT, lengths)
         loss = nn.functional.mse_loss(yhat, y)
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -179,16 +353,15 @@ def evaluate(
     loader: DataLoader,
     device: torch.device,
     *,
-    concat_XM: bool = True,
+    concat_XM: bool = False,
 ):
     model.eval()
     total = 0.0
     n = 0
     for batch in loader:
         batch = batch_to_device(batch, device)
-        X, M, lengths, y = batch["X"], batch["M"], batch["lengths"], batch["y"]
-        X_in = torch.cat([X, M], dim=-1) if concat_XM else X
-        yhat = model(X_in, lengths)
+        X, M, DT, lengths, y = batch["X"], batch["M"], batch["DT"], batch["lengths"], batch["y"]
+        yhat = model(X, M, DT, lengths)
         loss = nn.functional.mse_loss(yhat, y)
         bs = X.size(0)
         total += loss.item() * bs
@@ -201,7 +374,7 @@ def evaluate(
 # ----------------------------
 def run_k_fold_cv_earlystop(
     pkl_path: str = "data/processed/COPD_PATIENTS_DATA.pkl",
-    out_dir: str = "models/exp_simple_gru_cv_es",
+    out_dir: str = "models/exp_GRU_D_cv_es",
     *,
     batch_size: int = 64,
     hidden_size: int = 64,
@@ -212,7 +385,7 @@ def run_k_fold_cv_earlystop(
     epochs: int = 100,
     lr: float = 3e-4,
     seed: int = 42,
-    concat_XM: bool = True,  # True → feed [X||M]; False → only X
+    concat_XM: bool = False,  # True → feed [X||M]; False → only X
     val_frac: float = 0.1,  # inner validation fraction from outer-train
     patience: int = 5,  # early stopping patience on val MSE
     cv: int = 5,  # number of outer folds
@@ -266,14 +439,15 @@ def run_k_fold_cv_earlystop(
         test_loader = make_loader(ds, test_idx, batch_size=batch_size, shuffle=False)
 
         # Model / Optim
-        model = SimpleGRURegressor(
-            input_size=Din,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            dropout=dropout,
-            bidirectional=bidirectional,
-            fc_hidden=fc_hidden,
+        model = RETAINRegressor(
+            input_size=Din,  # Din = D or D*2 as you already compute
+            emb_size=128,
+            attn_hidden=64,
+            head_hidden=64,
+            dropout=0.1,
+            concat_XM=concat_XM,  # if you want to feed [X||M]
         ).to(device)
+
         optim = torch.optim.Adam(model.parameters(), lr=lr)
 
         # Early stopping bookkeeping
@@ -423,19 +597,41 @@ def run_k_fold_cv_earlystop(
 # 5) CLI entry
 # ----------------------------
 if __name__ == "__main__":
+    # install()
+    # import pretty_errors
+
+    # # # `configure` can be omitted if you're satisfied with default settings
+    # # pretty_errors.configure()
+    # pretty_errors.configure(
+    #     filename_display=pretty_errors.FILENAME_EXTENDED,
+    #     line_number_first=True,
+    #     display_link=True,
+    #     line_color=pretty_errors.RED + "> " + pretty_errors.default_config.line_color,
+    #     code_color="  " + pretty_errors.default_config.line_color,
+    #     truncate_code=True,
+    #     display_locals=True,
+    # )
+
+    # import better_exceptions
+
+    # better_exceptions.MAX_LENGTH = None
+    # # Check if you TERM variable is set to `xterm`, if not set below variable - https://github.com/Qix-/better-exceptions/issues/8
+    # better_exceptions.SUPPORTS_COLOR = True
+    # better_exceptions.hook()
+
     run_k_fold_cv_earlystop(
         pkl_path="data/processed/COPD_PATIENTS_DATA.pkl",
-        out_dir="models/exp_simple_gru_cv_es",
+        out_dir="models/exp_retain_cv_es",
         batch_size=128,  # 64,
         hidden_size=64,
         num_layers=2,  #! try 2 or 3 layers too
-        dropout=0.4,
+        dropout=0.1,
         bidirectional=False,
         fc_hidden=64,  # set None to use a single Linear
         epochs=500,  # upper bound; early stopping will usually stop sooner
         lr=3e-4,
         seed=42,
-        concat_XM=True,  # feed [X||M]; recommended when zeros denote missing
+        concat_XM=False,  # feed [X||M]; recommended when zeros denote missing
         val_frac=0.1,  # 10% of outer-train becomes inner-val
         patience=30,  # stop if no val improvement for 5 epochs
         cv=5,  # 5-fold cross-validation
