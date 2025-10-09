@@ -403,7 +403,7 @@ def evaluate(
 # ----------------------------
 def run_k_fold_cv_earlystop(
     pkl_path: str = "data/processed/COPD_PATIENTS_DATA.pkl",
-    out_dir: str = "models/exp_GRU_D_cv_es",
+    out_dir: str = "models/exp_TS_Transformer_cv_es",
     *,
     batch_size: int = 64,
     hidden_size: int = 64,
@@ -468,13 +468,27 @@ def run_k_fold_cv_earlystop(
         test_loader = make_loader(ds, test_idx, batch_size=batch_size, shuffle=False)
 
         # Model / Optim
+        # model = TimeSeriesTransformerRegressor(
+        #     input_size=Din,  # Din = D or D*2 if you set concat_XM=True in your loop
+        #     d_model=128,  # must be divisible by nhead
+        #     nhead=8,
+        #     num_layers=4,
+        #     dim_feedforward=256,
+        #     dropout=0.1,
+        #     concat_XM=concat_XM,  # keep in sync with how you compute Din
+        #     use_dt_feat=False,  # set True to append DT as a channel
+        #     pos_encoding="continuous",  # "sinusoidal" or "continuous" (uses DT cumsum)
+        #     pooling="mean",  # "mean" | "last" | "cls"
+        #     head_hidden=64,
+        # ).to(device)
+
         model = TimeSeriesTransformerRegressor(
             input_size=Din,  # Din = D or D*2 if you set concat_XM=True in your loop
             d_model=128,  # must be divisible by nhead
             nhead=8,
-            num_layers=4,
+            num_layers=num_layers,
             dim_feedforward=256,
-            dropout=0.1,
+            dropout=dropout,
             concat_XM=concat_XM,  # keep in sync with how you compute Din
             use_dt_feat=False,  # set True to append DT as a channel
             pos_encoding="continuous",  # "sinusoidal" or "continuous" (uses DT cumsum)
@@ -523,9 +537,9 @@ def run_k_fold_cv_earlystop(
             else:
                 no_improve += 1
                 if no_improve >= patience:
-                    # print(
-                    #     f"Early stopping (patience={patience}) at epoch {epoch}. Best epoch={best_epoch}."
-                    # )
+                    print(
+                        f"Early stopping (patience={patience}) at epoch {epoch}. Best epoch={best_epoch}."
+                    )
                     break
 
         # Load best and evaluate on TEST set
@@ -653,6 +667,24 @@ if __name__ == "__main__":
     # better_exceptions.SUPPORTS_COLOR = True
     # better_exceptions.hook()
 
+    # run_k_fold_cv_earlystop(
+    #     pkl_path="data/processed/COPD_PATIENTS_DATA.pkl",
+    #     out_dir="models/exp_tstransformer_cv_es",
+    #     batch_size=128,  # 64,
+    #     hidden_size=64,
+    #     num_layers=2,  #! try 2 or 3 layers too
+    #     dropout=0.1,
+    #     bidirectional=False,
+    #     fc_hidden=64,  # set None to use a single Linear
+    #     epochs=500,  # upper bound; early stopping will usually stop sooner
+    #     lr=3e-4,
+    #     seed=42,
+    #     concat_XM=False,  # feed [X||M]; recommended when zeros denote missing
+    #     val_frac=0.1,  # 10% of outer-train becomes inner-val
+    #     patience=30,  # stop if no val improvement for 5 epochs
+    #     cv=5,  # 5-fold cross-validation
+    # ) Test RMSE: 0.31±0.01 (MSE: 0.09 ± 0.01)
+
     run_k_fold_cv_earlystop(
         pkl_path="data/processed/COPD_PATIENTS_DATA.pkl",
         out_dir="models/exp_tstransformer_cv_es",
@@ -662,11 +694,11 @@ if __name__ == "__main__":
         dropout=0.1,
         bidirectional=False,
         fc_hidden=64,  # set None to use a single Linear
-        epochs=500,  # upper bound; early stopping will usually stop sooner
+        epochs=5000,  # upper bound; early stopping will usually stop sooner
         lr=3e-4,
         seed=42,
         concat_XM=False,  # feed [X||M]; recommended when zeros denote missing
         val_frac=0.1,  # 10% of outer-train becomes inner-val
-        patience=30,  # stop if no val improvement for 5 epochs
+        patience=20,  # stop if no val improvement for 5 epochs
         cv=5,  # 5-fold cross-validation
     )
