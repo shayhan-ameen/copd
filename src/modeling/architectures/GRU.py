@@ -341,9 +341,9 @@ def run_k_fold_cv_earlystop(
             f.write(f"val_mse_best={val_mse_final:.6f}\n")
             f.write(f"test_mse={test_mse:.6f}\n")
 
-        # print(
-        #     f"Fold {fold} → best_epoch={best_epoch} | train@best={train_mse_final:.6f} | val_best={val_mse_final:.6f} | test={test_mse:.6f}"
-        # )
+        print(
+            f"Fold {fold} → best_epoch={best_epoch} | train@best={train_mse_final:.6f} | val_best={val_mse_final:.6f} | test={test_mse:.6f}"
+        )
 
         fold_train_mse.append(float(train_mse_final))
         fold_val_mse.append(float(val_mse_final))

@@ -110,7 +110,6 @@ class ContinuousTimeEncoding(nn.Module):
         returns x + f(tau) with tau = cumsum(dt) along time.
         """
         tau = torch.cumsum(dt, dim=1)  # (B,T)
-        #! Use "continuous" pos encoding (you already do) so real time gaps (from DT) influence attention.
         # build sinusoidal embedding at runtime to match batch T
         B, T, D = x.shape
         freq = self.freq.to(x.device)  # (F,)
@@ -545,7 +544,7 @@ def run_k_fold_cv_earlystop(
             concat_XM=concat_XM,  # keep in sync with how you compute Din
             use_dt_feat=False,  # set True to append DT as a channel
             pos_encoding="continuous",  # "sinusoidal" or "continuous" (uses DT cumsum)
-            pooling="cls",  # "mean" | "last" | "cls" #! last or "cls"
+            pooling="mean",  # "mean" | "last" | "cls" #! last or "cls"
             head_hidden=64,
         ).to(device)
 
@@ -697,7 +696,7 @@ def run_k_fold_cv_earlystop(
 
     logger.success("Model:\n{}", model)
     logger.success(
-        f"Test RMSE: {test_rmse_avg:.6f}±{test_rmse_std:.6f} (MSE: {test_avg:.6f} ± {test_std:.6f})"
+        f"Test RMSE: {test_rmse_avg:.2f}±{test_rmse_std:.2f} (MSE: {test_avg:.2f} ± {test_std:.2f})"
     )
 
     # from torchinfo import summary
@@ -773,7 +772,7 @@ if __name__ == "__main__":
         epochs=5000,  # upper bound; early stopping will usually stop sooner
         lr=3e-4,
         seed=42,
-        concat_XM=True,  # feed [X||M]; recommended when zeros denote missing #! True
+        concat_XM=False,  # feed [X||M]; recommended when zeros denote missing #! True
         val_frac=0.1,  # 10% of outer-train becomes inner-val
         patience=30,  # stop if no val improvement for 5 epochs
         cv=5,  # 5-fold cross-validation

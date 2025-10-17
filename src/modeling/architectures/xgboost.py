@@ -190,12 +190,13 @@ def run_xgb_cv(
     out_path.mkdir(parents=True, exist_ok=True)
 
     # Build dataset (include age/gender/dt if desired in aggregates)
-    ds = TimeSeriesDataset(
-        pkl_path,
-        include_age=True,
-        include_gender=True,
-        include_dt_feature=True,
-    )
+    # ds = TimeSeriesDataset(
+    #     pkl_path,
+    #     include_age=True,
+    #     include_gender=True,
+    #     include_dt_feature=True,
+    # )
+    ds = TimeSeriesDataset(compute=False)
 
     N = len(ds)
     if N < k_folds:
@@ -301,7 +302,7 @@ def run_xgb_cv(
         f.write(f"train_rmse={tr_rmse_avg:.6f}, test_rmse={te_rmse_avg:.6f}\n")
 
     print("\n=== XGBoost 5-fold CV (no early stopping) Summary ===")
-    print(f"Avg Test RMSE: {te_rmse_avg:.4f} | Avg Test MSE: {te_mse_avg:.4f}")
+    print(f"Avg Test RMSE: {te_rmse_avg:.6f} | Avg Test MSE: {te_mse_avg:.6f}")
 
 
 # --------------------------

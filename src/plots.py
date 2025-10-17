@@ -17,7 +17,7 @@ from matplotlib.lines import Line2D
 from tqdm import tqdm
 
 from src import dataset
-from src.config import FIGURES_DIR, INTERIM_DATA_DIR
+from src.config import FIGURES_DIR, INTERIM_DATA_DIR, MODELS_DIR
 
 
 def plot_variable_statistics(
@@ -618,6 +618,7 @@ def plot_patient_timeseries(
     title_info = " | ".join(title_bits)
     title_note = "Note: FEV1/FVC 'Meas' is divided by 10 for visualization (e.g., 71.5 → 7.15)."
     fig.suptitle(f"{title_info}\n{title_note}", y=0.98)
+    # fig.suptitle(f"Model: Time Series Transformer \n{title_info}\n{title_note}", y=0.98)
 
     if put_dir is None:
         put_dir = Path(FIGURES_DIR) / "patient_timeseries"  # or pass put_dir explicitly
@@ -634,6 +635,8 @@ def plot_patient_timeseries(
 
 def plot_patients_timeseries(
     pkl_path: str = "data/processed/COPD_PATIENTS_DATA.pkl",
+    model_name: str = "exp_tstransformer_cv_es",  # "xgb_cv_no_es"
+    # model_name: str = "xgb_cv_no_es",
 ):
     """
     Plot patients.
@@ -642,9 +645,14 @@ def plot_patients_timeseries(
     with open(pkl_path, "rb") as f:
         patients_data: dict[Any, dict[str, Any]] = pickle.load(f)
 
+    # model_report_path = (
+    #     Path(MODELS_DIR) / "xgb_cv_no_es" / "all_folds_test_predictions_sorted_by_error.csv"
+    # )
     model_report_path = (
-        Path(MODELS_DIR) / "xgb_cv_no_es" / "all_folds_test_predictions_sorted_by_error.csv"
+        Path(MODELS_DIR) / f"{model_name}" / "all_folds_test_predictions_sorted_by_error.csv"
     )
+    put_dir = Path(FIGURES_DIR) / "patient_timeseries" / f"{model_name}"
+
     df = pd.read_csv(model_report_path)
     df_sorted = df.sort_values(by="error", ascending=True)
     # print(df_sorted.tail(5))
@@ -653,10 +661,15 @@ def plot_patients_timeseries(
     # Pick top-N worst (largest error) and top-N best (smallest error)
     best = df_sorted.head(num_plot)  # since sorted ascending, head = smallest errors
     worst = df_sorted.tail(num_plot)  # tail = largest errors
+    # temp_patients_ids = [1834489, 5265369, 2883825]
+    # best = df_sorted[df_sorted["pid"].isin(temp_patients_ids)]
+    # worst = None
 
     for prefix, subset in (("Best", best), ("Worst", worst)):
+        print(prefix)
         for _, row in subset.iterrows():
             pid = int(row["pid"])
+            print(pid)
             y_pred = float(row["y_pred"])
             err = float(row["error"]) if pd.notna(row["error"]) else None
 
@@ -665,9 +678,11 @@ def plot_patients_timeseries(
                 continue
 
             rec = patients_data[pid]
-            img_path = plot_patient_timeseries(pid, y_pred, err, rec, prefix=prefix)
+            img_path = plot_patient_timeseries(
+                pid, y_pred, err, rec, prefix=prefix, put_dir=put_dir
+            )
             err_str = "NA" if err is None else f"{err:.3f}"
-            print(f"{prefix}: Plotted PID {pid} (error={err_str})")
+            # print(f"{prefix}: Plotted PID {pid} (error={err_str})")
 
 
 if __name__ == "__main__":

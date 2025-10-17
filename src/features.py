@@ -125,8 +125,8 @@ class TargetSpec:
     # test_priority: tuple[str, str] = ("Post_BD", "Pre_PFT")  # prefer Post_BD, fallback Pre_PFT
     test_priority: tuple[str, ...] = ("Pre_PFT",)  # prefer Pre_PFT
     #! Target is FEV1/FVC or FEV1
-    measurement: str = "FEV1"
-    # measurement: str = "FEV1/FVC"
+    # measurement: str = "FEV1"
+    measurement: str = "FEV1/FVC"
     variable: str = "Meas"  # FEV1 Meas
 
 
@@ -152,7 +152,16 @@ def _extract_value_for_visit(
     val = cand[value_col].dropna()
     # TODO CKECK if multiple rows exist i.e Pre_PFT and Post_BD occure in the same date
     # TODO take the last non-NA value (or first; consistency is key)
-    return float(val.iloc[-1]) if not val.empty else None
+    # return float(val.iloc[-1]) if not val.empty else None
+    if val.empty:
+        return None
+
+    result = float(val.iloc[-1])
+
+    # Divide by 100 if the measurement is FEV1/FVC
+    if want_meas.upper() == "FEV1/FVC":
+        result /= 100.0
+    return result
 
 
 def _find_y_backward(
@@ -186,7 +195,7 @@ def _find_y_backward(
                 # Must have at least one history step before y
                 if idx == 0:
                     return (None, None, None)
-                return (idx, val, tname)
+                return (idx, val, f"{tname}->{target.measurement}->{target.variable}")
     return (None, None, None)
 
 
