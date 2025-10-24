@@ -1,4 +1,4 @@
-# src/features.py
+# src/features.py (wide-format version)
 from __future__ import annotations
 
 import os
@@ -14,13 +14,25 @@ from tqdm import tqdm
 
 from src.config import INTERIM_DATA_DIR, PROCESSED_DATA_DIR
 
-# ----------------------------
+# -------------------------------------------------------------------
+# Expect PATIENT_MAP and IGNORE_PATIENT_MAP to be imported/defined
+# exactly as you posted in your message.
+# -------------------------------------------------------------------
+# from src.patient_map import PATIENT_MAP, IGNORE_PATIENT_MAP
+# (Or just keep them in this file above.)
+
+
+#  ----------------------------
 # 0) Clinical feature template
 # ----------------------------
+# Use OrderedDict to lock a deterministic traversal order (important for models).
+
 PATIENT_MAP: dict[str, list[str]] = OrderedDict(
     {
         "basic_info": ["H_no", "number_of_visit"],
         "test_result": [
+            # "dt_gap
+            # "Sex"
             "ht",
             "bw",
             "Age",
@@ -168,7 +180,12 @@ PATIENT_MAP: dict[str, list[str]] = OrderedDict(
             "Exacerbation_Date_2",
             "Exacerbation_Treatment_2",
         ],
-        "target_info": ["y", "y_index", "y_source", "y_date"],
+        "target_info": [
+            "y",
+            "y_index",
+            "y_source",
+            "y_date",
+        ],
     }
 )
 
@@ -212,23 +229,43 @@ PATIENT_MAP_CONTROLLER = {
     },
 }
 
-# ----------------------------
-# Helpers
-# ----------------------------
 
-
+# ----------------------------
+# 0) Helpers
+# ----------------------------
 def _norm(s: str) -> str:
     return (s or "").strip().lower()
+
+
+def _age_years_from(dob: pd.Timestamp | None, on_date: pd.Timestamp | None) -> int | None:
+    if pd.isna(dob) or pd.isna(on_date):
+        return None
+    return int((on_date.date() - dob.date()).days // 365)
 
 
 def _parse_date_any(x) -> pd.Timestamp | None:
     if pd.isna(x):
         return pd.NaT
-    s = str(x).strip()
-    ts = pd.to_datetime(s, format="%Y%m%d", errors="coerce")
+    ts = pd.to_datetime(x, errors="coerce")
     if pd.isna(ts):
-        ts = pd.to_datetime(s, errors="coerce")
+        # Try YYYYMMDD first (your classic format), then fallback
+        ts = pd.to_datetime(x, format="%Y%m%d", errors="coerce")
+
     return ts
+
+
+# def _maybe_scale_ratio(value: float | None, colname: str) -> float | None:
+#     """
+#     Convert obvious percent ratios into [0,1] if they look like 70.0 for FEV1/FVC etc.
+#     Trigger only for FEV1/FVC (pre/post) measured columns.
+#     """
+#     if value is None or pd.isna(value):
+#         return None
+#     name = _norm(colname)
+#     is_fev1fvc_meas = name in {"fev1_fvc_meas", "postfev1_fvc_meas"}
+#     if is_fev1fvc_meas and value > 1.5:  # likely in [0,100]
+#         return float(value) / 100.0
+#     return float(value)
 
 
 def _coerce_numeric_inplace(df: pd.DataFrame, cols: Iterable[str]) -> None:
@@ -238,121 +275,112 @@ def _coerce_numeric_inplace(df: pd.DataFrame, cols: Iterable[str]) -> None:
 
 
 def _coerce_dates_inplace(df: pd.DataFrame, cols: Iterable[str]) -> None:
-    """Vectorized: try %Y%m%d first, then general parse on remaining NaT rows."""
     for c in cols:
-        if c not in df.columns:
-            continue
-        s = pd.to_datetime(df[c], format="%Y%m%d", errors="coerce")
-        mask = s.isna()
-        if mask.any():
-            s.loc[mask] = pd.to_datetime(df.loc[mask, c], errors="coerce")
-        df[c] = s
+        if c in df.columns:
+            df[c] = df[c].apply(_parse_date_any)
 
 
 # ----------------------------
-# Per-visit feature extraction
+# 2) Per-visit feature extraction (wide)
 # ----------------------------
-
-
 def _make_visit_feature_record(
-    visit_df: pd.DataFrame,
-    *,
-    gender_val: Any,
+    visit_df,
+    *gender_val: Any,
     dt_gap: int,
     test_cols: list[str],
     tol: float = 1e-6,
 ) -> dict[str, Any]:
-    """Build a per-visit dict with latest values for each test col, plus treatment/exacerbation snapshot.
-    Output keys are **flat** feature names (no nested clinical_values). Extras:
-      - out['gender'] (from patient-level gender)
-      - out['dt_gap'] (days until target)
     """
-    out: dict[str, Any] = {"dt_gap": int(dt_gap), "gender": gender_val}
+    Builds a per-visit dictionary:
+      - 'Age' (use row['Age'] if present else compute from dob)
+      - 'Gender'
+      - 'days_to_target'
+      - 'test_result': subset of PATIENT_MAP['test_result']
+      - 'treatment_info': subset of PATIENT_MAP['treatment_info']
+    """
+    # Age
+    # visit_date = row.get(date_col, pd.NaT)
+    # age_from_dob = _age_years_from(dob_val, visit_date)
+    # age_val = row.get("Age", None)
+    # if pd.isna(age_val) or age_val is None:
+    #     age_val = age_from_dob
 
-    # Latest usable value per test column
+    # Copy test_result columns
+    out: dict[str, Any] = {}
+
+    out[dt_gap] = (int(dt_gap),)
+
+    out["Gender"] = gender_val
+
     for col in test_cols:
-        if col not in visit_df.columns:
+        vals = visit_df[col].copy().dropna()
+        vals = [v for v in vals if v - 0.0 >= tol]
+        out[cpl] = None if pd.isna(val) else val
+        if vals.empty:
             out[col] = None
-            continue
-        vals = pd.to_numeric(visit_df[col], errors="coerce").dropna()
-        if tol is not None:
-            vals = vals[vals > tol]
-        out[col] = None if vals.empty else float(vals.iloc[-1])
+        else:
+            out[col] = float(vals.iloc[-1])
 
-    # Inhaler (latest by End date; fallback to Start)
-    if "Inhaler_Name" in visit_df.columns:
-        df_inh = visit_df.dropna(subset=["Inhaler_Name"]).copy()
-    else:
-        df_inh = pd.DataFrame()
+    # -------------------
+    # Inhaler Section
+    # -------------------
+    df_inh = visit_df.copy().dropna(subset=["Inhaler_Name"])
 
     if df_inh.empty:
-        out.update(
-            {
-                "Inhaler_Name": None,
-                "Drug_Class": None,
-                "Device_Type": None,
-                "Inhaler_Duration": None,
-            }
-        )
+        out["Inhaler_Name"] = None
+        out["Drug_Class"] = None
+        out["Device_Type"] = None
+        out["Inhaler_Duration"] = None
     else:
-        for c in ("Inhaler_Start_Date", "Inhaler_End_Date"):
-            if c in df_inh.columns:
-                df_inh[c] = pd.to_datetime(df_inh[c], errors="coerce")
-        if "Inhaler_End_Date" in df_inh.columns:
-            df_inh = df_inh.sort_values(
-                ["Inhaler_End_Date", "Inhaler_Start_Date"],
-                ascending=[True, True],
-                na_position="first",
-            )
-        elif "Inhaler_Start_Date" in df_inh.columns:
-            df_inh = df_inh.sort_values("Inhaler_Start_Date", ascending=True, na_position="first")
-        row = df_inh.iloc[-1]
-        start_dt = row.get("Inhaler_Start_Date", pd.NaT)
-        end_dt = row.get("Inhaler_End_Date", pd.NaT)
-        duration_days = (
-            (end_dt - start_dt).days if (pd.notna(start_dt) and pd.notna(end_dt)) else None
-        )
-        out.update(
-            {
-                "Inhaler_Name": row.get("Inhaler_Name", None),
-                "Drug_Class": row.get("Drug_Class", None),
-                "Device_Type": row.get("Device_Type", None),
-                "Inhaler_Duration": duration_days,
-            }
-        )
+        # Ensure datetime conversion
+        df_inh["Inhaler_Start_Date"] = pd.to_datetime(df_inh["Inhaler_Start_Date"], errors="coerce")
+        df_inh["Inhaler_End_Date"] = pd.to_datetime(df_inh["Inhaler_End_Date"], errors="coerce")
 
-    # Exacerbation (latest by date if present)
-    if "Exacerbation" in visit_df.columns:
-        df_ex = visit_df.dropna(subset=["Exacerbation"]).copy()
-    else:
-        df_ex = pd.DataFrame()
+        # Sort by end date to ensure latest inhaler is chosen
+        df_inh = df_inh.sort_values("Inhaler_End_Date", ascending=True)
+
+        # Select the last (most recent) record
+        row = df_inh.iloc[-1]
+
+        # Compute duration in days (handle missing safely)
+        if pd.notna(row["Inhaler_End_Date"]) and pd.notna(row["Inhaler_Start_Date"]):
+            duration_days = (row["Inhaler_End_Date"] - row["Inhaler_Start_Date"]).days
+        else:
+            duration_days = None
+
+        # Assign to dict
+        out["Inhaler_Name"] = row["Inhaler_Name"]
+        out["Drug_Class"] = row["Drug_Class"]
+        out["Device_Type"] = row["Device_Type"]
+        out["Inhaler_Duration"] = duration_days
+
+    # -------------------
+    # Exacerbation Section
+    # -------------------
+    df_ex = visit_df.copy().dropna(subset=["Exacerbation"])
 
     if df_ex.empty:
-        out.update(
-            {
-                "Exacerbation": None,
-                "Exacerbation_Type": None,
-                "Exacerbation_Treatment": None,
-            }
-        )
+        out["Exacerbation"] = None
+        out["Exacerbation_Type"] = None
+        out["Exacerbation_Treatment"] = None
     else:
+        # Sort by date if there's an Exacerbation_Date column
         if "Exacerbation_Date" in df_ex.columns:
-            df_ex["Exacerbation_Date"] = pd.to_datetime(df_ex["Exacerbation_Date"], errors="coerce")
-            df_ex = df_ex.sort_values("Exacerbation_Date", ascending=True, na_position="first")
+            df_ex = df_ex.sort_values("Exacerbation_Date", ascending=True)
+
+        # Select last (most recent) record
         row = df_ex.iloc[-1]
-        out.update(
-            {
-                "Exacerbation": row.get("Exacerbation", None),
-                "Exacerbation_Type": row.get("Exacerbation_Type", None),
-                "Exacerbation_Treatment": row.get("Exacerbation_Treatment", None),
-            }
-        )
+
+        # Assign to dict
+        out["Exacerbation"] = row["Exacerbation"]
+        out["Exacerbation_Type"] = row["Exacerbation_Type"]
+        out["Exacerbation_Treatment"] = row["Exacerbation_Treatment"]
 
     return out
 
 
 # ----------------------------
-# Target selection
+# 3) Find y (target) by walking backward
 # ----------------------------
 
 
@@ -361,71 +389,26 @@ def _find_y_backward(
     date_order: list[pd.Timestamp],
     target_col: str = "FEV1_FVC_Meas",
 ) -> tuple[int | None, float | None, str | None, pd.Timestamp | None]:
+    """
+    Walk backward over visits. Return (y_index, y_value, y_source_test) where y is FEV1 Meas,
+    preferring Post_BD then Pre_PFT. If not found or y_index==0, return (None, None, None).
+    """
     for idx in range(len(visit_groups) - 1, -1, -1):
         visit_df = visit_groups[idx]
-        if target_col not in visit_df.columns:
-            continue
-        vals = pd.to_numeric(visit_df[target_col], errors="coerce").dropna()
+        vals = visit_df[target_col].dropna()
         if vals.empty:
+            # return (None, None, None, None)
             continue
-        y_val = float(vals.iloc[-1])
+        y_val = float(vals.iloc[-1])  #! Pick last or mean?
         if target_col.lower() == "fev1_fvc_meas":
-            y_val = y_val / 100.0
+            y_val = float(y_val) / 100.0
         return (idx, y_val, target_col, date_order[idx])
     return (None, None, None, None)
 
 
-def compute_y_age(
-    g: pd.DataFrame,
-    y_date: Any,
-    *,
-    date_col: str = "PFT_date",
-    age_col: str = "Age",
-) -> float:
-    """
-    Age at y_date.
-
-    Rules:
-      1) If there is an age on y_date, use it.
-      2) If all ages are NaN, return NaN.
-      3) Otherwise, take the closest dated age and adjust by the day gap / 365.2425.
-    """
-    if age_col not in g.columns or date_col not in g.columns:
-        return float("nan")
-
-    if pd.isna(y_date):
-        return float("nan")
-    y_date = pd.Timestamp(y_date).normalize()
-
-    ages = pd.to_numeric(g[age_col], errors="coerce")
-    dates = pd.to_datetime(g[date_col], errors="coerce").dt.normalize()
-
-    # 1) Exact match on y_date
-    exact = ages[dates == y_date].dropna()
-    if not exact.empty:
-        return float(exact.iloc[-1])
-
-    # 2) If all ages are NaN
-    if ages.dropna().empty:
-        return float("nan")
-
-    # 3) Project from closest dated age
-    df_age = pd.DataFrame({"age": ages, "date": dates}).dropna()
-    if df_age.empty:
-        return float("nan")
-
-    df_age["delta_days"] = (y_date - df_age["date"]).dt.days
-    i = df_age["delta_days"].abs().idxmin()
-    base_age = float(df_age.loc[i, "age"])
-    delta_years = float(df_age.loc[i, "delta_days"]) / 365.2425
-    return base_age + delta_years
-
-
 # ----------------------------
-# Build single patient record (wide)
+# 4) Build single patient record (wide)
 # ----------------------------
-
-
 def _build_single_patient_record_wide(
     pid: Any,
     g: pd.DataFrame,
@@ -434,38 +417,61 @@ def _build_single_patient_record_wide(
     date_col: str,
     gender_col: str,
     test_cols: list[str],
+    # treat_cols: list[str],
     target_col: str = "FEV1_FVC_Meas",
 ) -> tuple[Any, dict[str, Any] | None]:
+    """
+    Returns (pid, record_dict_or_None)
+    g is the mini-DataFrame for a single patient with wide columns per visit.
+    """
+    # Parse dates & sort
     g = g.copy()
     g = g.dropna(subset=[date_col])
     if g.empty:
         return pid, None
+    g = g.sort_values(
+        by=[
+            date_col,
+        ]
+    ).reset_index(drop=True)
 
-    g = g.sort_values(by=[date_col]).reset_index(drop=True)
-
+    # Coerce numeric in test_result columns (best-effort)
     _coerce_numeric_inplace(g, test_cols)
 
+    # Pull stable demographics
     gender_val = None
     if gender_col in g.columns:
-        idx0 = g[gender_col].first_valid_index()
-        gender_val = None if idx0 is None else g.loc[idx0, gender_col]
+        first_valid = g[gender_col].first_valid_index()
+        gender_val = None if first_valid is None else g.loc[first_valid, gender_col]
 
-    visit_dates = (
-        pd.to_datetime(g[date_col], errors="coerce").dropna().sort_values().unique().tolist()
-    )
-    if not visit_dates:
+    # Collect distinct visit dates (ascending)
+    visit_dates = g[date_col].dropna().sort_values().unique().tolist()
+    num_visits = len(visit_dates)
+    if num_visits == 0:
         return pid, None
 
+    # Split group into per-visit mini-dataframes
     visits: list[pd.DataFrame] = [g[g[date_col] == d] for d in visit_dates]
 
+    # Target
+    # y_index, y_value, y_source_col, y_date = _find_y_backward_wide(g, date_col, target)
     y_index, y_value, y_source_col, y_date = _find_y_backward(visits, visit_dates, target_col)
     if y_index is None or y_value is None or y_date is None:
         return pid, None
 
+    # Build history timeseries [0 : y_index)
     ts_list: list[dict[str, Any]] = []
-    for idx, vdate in enumerate(visit_dates[:y_index]):
+    for idx in range(0, y_index):
+        # row = g.iloc[idx]
+        # cur_date = visit_dates[idx]
+        # days_to_target = int((y_date - cur_date).days)
+
         vdf = visits[idx]
-        dt_gap = int((visit_dates[y_index] - vdate).days)
+        vdate = visit_dates[idx]
+        dt_gap = int(
+            (visit_dates[y_index] - vdate).days
+        )  # dt_gap relative to y_date (target visit)
+
         single = _make_visit_feature_record(
             vdf,
             gender_val=gender_val,
@@ -474,47 +480,61 @@ def _build_single_patient_record_wide(
         )
         ts_list.append(single)
 
-        y_age = compute_y_age(g, y_date, date_col=date_col, age_col="Age")
+    # Basic info
+    num_visits = int(g[date_col].nunique())
+    basic_info = {
+        "H_no": pid,
+        "ht": g["ht"].dropna().iloc[0]
+        if "ht" in g.columns and not g["ht"].dropna().empty
+        else None,
+        "bw": g["bw"].dropna().iloc[0]
+        if "bw" in g.columns and not g["bw"].dropna().empty
+        else None,
+        "gender": gender_val,
+        "dob": dob_val,
+        "number_of_visit": num_visits,
+    }
 
     out = {
         "patient_id": pid,
-        "number_of_visit": len(visit_dates),
+        "basic_info": basic_info,
         "y": float(y_value),
         "y_index": int(y_index),
         "y_source": str(y_source_col),
         "y_date": pd.Timestamp(y_date),
-        "y_age": y_age,  # Ahe of the patient on the y_date
         "patient_timeseries": ts_list,
     }
     return pid, out
 
 
 # ----------------------------
-# Public API: build patients_data
+# 5) Public API: build patients_data (wide)
 # ----------------------------
-
-
-def build_patients_data(
-    df_path: str | Path = INTERIM_DATA_DIR / "All Inhaler MERGED.csv",
+def build_patients_data_wide(
+    df_path: str | Path = INTERIM_DATA_DIR / "All Inhaler Filtered.csv",
     output_path: str | Path = PROCESSED_DATA_DIR / "NEW_COPD_PATIENTS_DATA.pkl",
     *,
     id_col: str = "H_no",
     date_col: str = "PFT_date",
     gender_col: str = "Sex",
-    dob_col: str = "Date of Birth",
-    patient_map: dict[str, list[str]] | None = None,
-    ignore_map: dict[str, list[str]] | None = None,
+    dob_col: str = "Date of Birth",  #! not present
+    # Column maps
+    patient_map: dict[str, list[str]] = None,
+    ignore_map: dict[str, list[str]] = None,
     target_col: str = "FEV1_FVC_Meas",
-    max_workers: int | None = None,
 ) -> dict[Any, dict[str, Any]]:
+    """
+    Build patients_data from a wide-format dataframe where each row = one visit.
+    """
     if patient_map is None:
         patient_map = PATIENT_MAP
+        # raise ValueError("patient_map (PATIENT_MAP) must be provided.")
     if ignore_map is None:
         ignore_map = PATIENT_MAP_CONTROLLER["ignore"]
 
     df = pd.read_csv(df_path)
-
-    _coerce_dates_inplace(
+    # Parse dates for key columns early (robust)
+    _coerce_dates_inplace(  #! problem
         df,
         [
             date_col,
@@ -525,102 +545,81 @@ def build_patients_data(
             "Exacerbation_Date_2",
         ],
     )
-    df = df.dropna(subset=[date_col])
+    df = df.dropna(subset=[date_col])  # Drop rows without a valid visit date
 
+    # Decide which columns to keep per section
     def _section_cols(section: str) -> list[str]:
         cols = list(patient_map.get(section, []))
+        # Drop ignored
         for c in ignore_map.get(section, []):
             if c in cols:
                 cols.remove(c)
+        # Keep only those present in df
         return [c for c in cols if c in df.columns]
 
+    # basic_cols = _section_cols("basic_info")
     test_cols = _section_cols("test_result")
     _coerce_numeric_inplace(df, test_cols)
-    treat_cols = _section_cols("treatment_info")
+    df[test_cols] = df[test_cols].apply(pd.to_numeric, errors="coerce")
 
-    keep_cols = sorted(
-        set([id_col, date_col, gender_col, dob_col])
-        | set(test_cols)
-        | set(treat_cols)
-        | {target_col}
-    )
-    keep_cols = [c for c in keep_cols if c in df.columns]
-    df = df[keep_cols].copy()
+    # treat_cols = _section_cols("treatment_info")
 
+    # Group per patient
     groups: list[tuple[Any, pd.DataFrame]] = [
         (pid, g.copy(deep=True)) for pid, g in df.groupby(id_col, sort=False) if not g.empty
     ]
 
-    print(f"Total input patients: {len(groups)}")
+    max_workers = max(1, min(48, (os.cpu_count() or 8) - 2))
 
-    if max_workers is None:
-        max_workers = max(1, min(48, (os.cpu_count() or 8) - 2))
+    # Deterministic aggregation: preserve groups order
+    index_by_pid = {pid: i for i, (pid, _) in enumerate(groups)}
+    tmp: dict[Any, dict[str, Any]] = {}
 
-    results_tmp: dict[Any, dict[str, Any]] = {}
+    with ProcessPoolExecutor(max_workers=max_workers) as ex:
+        fut2pid = {
+            ex.submit(
+                _build_single_patient_record_wide,
+                pid,
+                g,
+                id_col=id_col,
+                date_col=date_col,
+                gender_col=gender_col,
+                test_cols=test_cols,
+                target_col=target_col,
+            ): pid
+            for pid, g in groups
+        }
+        for fut in tqdm(as_completed(fut2pid), total=len(fut2pid), desc="Collecting patients data"):
+            pid_out, rec = fut.result()
+            if rec is not None:
+                tmp[pid_out] = rec
 
-    if max_workers == 1:
-        for pid, g in tqdm(groups, total=len(groups), desc="Building patients data"):
-            try:
-                _, rec = _build_single_patient_record_wide(
-                    pid,
-                    g,
-                    id_col=id_col,
-                    date_col=date_col,
-                    gender_col=gender_col,
-                    test_cols=test_cols,
-                    target_col=target_col,
-                )
-                if rec is not None:
-                    results_tmp[pid] = rec
-            except Exception as e:
-                print(f"[WARN] Failed pid={pid}: {e}")
-    else:
-        with ProcessPoolExecutor(max_workers=max_workers) as ex:
-            fut2pid = {
-                ex.submit(
-                    _build_single_patient_record_wide,
-                    pid,
-                    g,
-                    id_col=id_col,
-                    date_col=date_col,
-                    gender_col=gender_col,
-                    test_cols=test_cols,
-                    target_col=target_col,
-                ): pid
-                for pid, g in groups
-            }
-            for fut in tqdm(
-                as_completed(fut2pid), total=len(fut2pid), desc="Collecting patients data"
-            ):
-                pid_out = fut2pid[fut]
-                try:
-                    pid_ret, rec = fut.result()
-                    if rec is not None:
-                        results_tmp[pid_ret] = rec
-                except Exception as e:
-                    print(f"[WARN] Failed pid={pid_out}: {e}")
-
-    ordered: OrderedDict[Any, dict[str, Any]] = OrderedDict()
+    results: OrderedDict[Any, dict[str, Any]] = OrderedDict()
     for pid, _ in groups:
-        if pid in results_tmp:
-            ordered[pid] = results_tmp[pid]
+        if pid in tmp:
+            results[pid] = tmp[pid]
 
     with open(output_path, "wb") as f:
-        pickle.dump(ordered, f, protocol=pickle.HIGHEST_PROTOCOL)
-    print(f"Saved {len(ordered)} patients to {output_path}")
+        pickle.dump(results, f, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f"Saved {len(results)} patients to {output_path}")
 
-    return ordered
+    return results
 
 
+# ----------------------------
+# 6) Example usage
+# ----------------------------
 if __name__ == "__main__":
     # Example:
-    # build_patients_data(
+    # build_patients_data_wide(
     #     df_path=INTERIM_DATA_DIR / "ALL_VISITS_WIDE.csv",
-    #     output_path=PROCESSED_DATA_DIR / "NEW_COPD_PATIENTS_DATA.pkl",
+    #     output_path=PROCESSED_DATA_DIR / "COPD_PATIENTS_DATA_WIDE.pkl",
     #     id_col="H_no",
     #     date_col="PFT_date",
-    #     gender_col="Sex",
-    #     target_col="FEV1_FVC_Meas",
-    #     max_workers=1,
+    #     gender_col="gender",
+    #     dob_col="dob",
+    #     patient_map=PATIENT_MAP,
+    #     ignore_map=IGNORE_PATIENT_MAP,
+    #     target=TargetSpecWide(target_priority=("postFEV1_FVC_Meas", "FEV1_FVC_Meas")),  # or FEV1
     # )
     pass

@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import pickle
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -11,10 +9,8 @@ import torch
 # XGBoost
 from xgboost import XGBRegressor
 
-from src.config import PROCESSED_DATA_DIR
-from src.features import PATIENT_MAP  # for stable feature order
-
 # Your dataset builder
+from src.modeling.ragged_timeseries import TimeSeriesDataset
 
 
 # --------------------------
@@ -41,180 +37,54 @@ def kfold_train_test_indices(n: int, k: int = 5, seed: int = 42):
 # --------------------------
 # 1) Sequence → Tabular features
 # --------------------------
-
-
-def feature_order(
-    include_gender: bool = True,
-    include_dt: bool = True,
-    include_treatment: bool = True,
-    include_exac: bool = True,
-) -> List[str]:
-    order = list(PATIENT_MAP.get("test_result", []))
-    if include_gender:
-        order.append("gender")
-    if include_dt:
-        order.append("dt_gap")
-    if include_treatment:
-        order.extend(["Inhaler", "Inhaler_Duration"])
-    if include_exac:
-        order.append("Exacerbation")
-    return order
-
-
-def _as_float_or_none(v) -> float | None:
-    if v is None:
-        return None
-    try:
-        f = float(v)
-        if pd.isna(f):
-            return None
-        return f
-    except Exception:
-        return None
-
-
-def _present(v) -> bool:
-    if v is None:
-        return False
-    try:
-        if pd.isna(v):
-            return False
-    except Exception:
-        pass
-    if isinstance(v, str):
-        return v.strip() != ""
-    return True
-
-
-def _flatten_visit_numpy(
-    visit: dict[str, Any], columns: List[str]
-) -> Tuple[np.ndarray, np.ndarray, float]:
-    """Return (x_row, m_row, dt_gap_value) for one visit."""
-    x_vals, m_vals = [], []
-    # collect dt_gap for span computation
-    dt_gap_val = _as_float_or_none(visit.get("dt_gap", visit.get("dt_gap_days", None)))
-
-    for col in columns:
-        if col == "gender":
-            g = str(visit.get("gender", visit.get("Gender", ""))).strip().upper()
-            if g in {"M", "MALE", "1"}:
-                x_vals.append(1.0)
-                m_vals.append(1.0)
-            elif g in {"F", "FEMALE", "0"}:
-                x_vals.append(0.0)
-                m_vals.append(1.0)
-            else:
-                x_vals.append(0.0)
-                m_vals.append(0.0)
-            continue
-
-        if col == "dt_gap":
-            f = dt_gap_val
-            if f is None:
-                x_vals.append(0.0)
-                m_vals.append(0.0)
-            else:
-                x_vals.append(f)
-                m_vals.append(1.0)
-            continue
-
-        if col == "Inhaler":
-            inh_present = any(
-                _present(visit.get(k))
-                for k in ("Inhaler_Name", "Inhaler_Start_Date", "Inhaler_End_Date")
-            )
-            if not inh_present:
-                inh_present = _as_float_or_none(visit.get("Inhaler_Duration")) is not None
-            x_vals.append(1.0 if inh_present else 0.0)
-            m_vals.append(1.0 if inh_present else 0.0)
-            continue
-
-        if col == "Inhaler_Duration":
-            f = _as_float_or_none(visit.get("Inhaler_Duration"))
-            if f is None:
-                x_vals.append(0.0)
-                m_vals.append(0.0)
-            else:
-                x_vals.append(f)
-                m_vals.append(1.0)
-            continue
-
-        if col == "Exacerbation":
-            ex_present = _present(visit.get("Exacerbation")) or _present(
-                visit.get("Exacerbation_Date")
-            )
-            x_vals.append(1.0 if ex_present else 0.0)
-            m_vals.append(1.0 if ex_present else 0.0)
-            continue
-
-        # regular numeric
-        f = _as_float_or_none(visit.get(col))
-        if f is None:
-            x_vals.append(0.0)
-            m_vals.append(0.0)
-        else:
-            x_vals.append(f)
-            m_vals.append(1.0)
-
-    return (
-        np.asarray(x_vals, dtype=float),
-        np.asarray(m_vals, dtype=float),
-        (dt_gap_val if dt_gap_val is not None else np.nan),
-    )
-
-
-def _last_observed_per_feature(X: np.ndarray, M: np.ndarray) -> np.ndarray:
-    T, D = X.shape
+def last_observed_per_feature(X: np.ndarray, M: np.ndarray) -> np.ndarray:
+    """
+    For each feature d, return the last observed value over time (NaN if never observed).
+    X, M: (T, D)
+    """
+    _, D = X.shape
     out = np.full(D, np.nan, dtype=float)
     for d in range(D):
-        obs = np.where(M[:, d] == 1)[0]
-        if obs.size:
-            out[d] = X[obs[-1], d]
+        obs_idx = np.where(M[:, d] == 1)[0]
+        if obs_idx.size:
+            t_last = obs_idx[-1]
+            out[d] = float(X[t_last, d])
     return out
 
 
-def _mean_observed_per_feature(X: np.ndarray, M: np.ndarray) -> np.ndarray:
+def mean_observed_per_feature(X: np.ndarray, M: np.ndarray) -> np.ndarray:
+    """Mean over observed entries per feature (NaN if never observed)."""
     num = (X * M).sum(axis=0)
     den = M.sum(axis=0)
-    mu = np.divide(num, den, out=np.full_like(num, np.nan, dtype=float), where=den != 0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mu = num / den
+    mu[den == 0] = np.nan
     return mu
 
 
-def _count_observed_per_feature(M: np.ndarray) -> np.ndarray:
+def count_observed_per_feature(M: np.ndarray) -> np.ndarray:
+    """Counts of observed timesteps per feature."""
     return M.sum(axis=0).astype(float)
 
 
-def build_xgb_tabular_from_pkl(
-    pkl_path: str | Path,
+def build_tabular_from_dataset(
+    ds: TimeSeriesDataset,
     *,
-    include_gender: bool = True,
-    include_dt: bool = True,
-    include_treatment: bool = True,
-    include_exac: bool = True,
     include_last: bool = True,
     include_mean: bool = True,
     include_count: bool = True,
     add_length: bool = True,
     add_span_days: bool = True,
-    min_visits: int = 1,  # try 2 to match old
-) -> tuple[pd.DataFrame, pd.Series, list[str], list[Any]]:
-    """Pure pandas/NumPy path to get XGB-ready features (no Torch)."""
-    with open(pkl_path, "rb") as f:
-        data: dict[Any, dict[str, Any]] = pickle.load(f)
-
-    print(f"{pkl_path=}")
-
-    columns = feature_order(
-        include_gender=include_gender,
-        include_dt=include_dt,
-        include_treatment=include_treatment,
-        include_exac=include_exac,
-    )
-
+) -> tuple[pd.DataFrame, pd.Series, list[str]]:
+    """
+    One row per patient:
+      Features: last_[f], mean_[f], count_[f], seq_length, span_days
+      Target: y
+    """
     rows, ys, pids = [], [], []
-    # feature names
-    D = len(columns)
-    feat_names: list[str] = []
+    D = ds[0]["X"].shape[1]
+
+    feat_names = []
     if include_last:
         feat_names += [f"last_f{d}" for d in range(D)]
     if include_mean:
@@ -226,53 +96,29 @@ def build_xgb_tabular_from_pkl(
     if add_span_days:
         feat_names.append("span_days")
 
-    print(f"{len(data.keys())=}")
+    for i in range(len(ds)):
+        item = ds[i]
+        pid = item.get("pid") if isinstance(item, dict) else None
+        X = item["X"].numpy()  # (T, D)
+        M = item["M"].numpy()  # (T, D)
+        DT = item["DT"].numpy()  # (T,)
+        T = int(item["length"].item())
+        y = float(item["y"].item())
 
-    for pid, rec in data.items():
-        visits = rec.get("patient_timeseries", [])
-        y = rec.get("y", None)
-        if (y is None) or (len(visits) < min_visits):
-            continue
-
-        # build per-visit arrays
-        X_rows, M_rows, gaps = [], [], []
-        for v in visits:
-            x_row, m_row, gap = _flatten_visit_numpy(v, columns)
-            X_rows.append(x_row)
-            M_rows.append(m_row)
-            gaps.append(gap)
-
-        X = np.vstack(X_rows)  # (T, D)
-        M = np.vstack(M_rows)  # (T, D)
-
-        # span days from dt_gap diffs (like GRU-D DT construction)
-        # DT[1:] = g[:-1] - g[1:], DT[0]=0; span_days = sum(DT)
-        gaps_arr = np.asarray(gaps, dtype=float)
-        DT = np.zeros(len(gaps_arr), dtype=float)
-        if len(gaps_arr) > 1:
-            # replace NaNs with previous value to avoid nan diffs; conservative fallback
-            g = gaps_arr.copy()
-            # forward fill NaNs
-            for i in range(len(g)):
-                if np.isnan(g[i]):
-                    g[i] = g[i - 1] if i > 0 else g[i]
-            DT[1:] = g[:-1] - g[1:]
-        span_days = float(np.nansum(DT))
-
-        feats: list[float] = []
+        feats = []
         if include_last:
-            feats.extend(_last_observed_per_feature(X, M))
+            feats.extend(last_observed_per_feature(X, M))
         if include_mean:
-            feats.extend(_mean_observed_per_feature(X, M))
+            feats.extend(mean_observed_per_feature(X, M))
         if include_count:
-            feats.extend(_count_observed_per_feature(M))
+            feats.extend(count_observed_per_feature(M))
         if add_length:
-            feats.append(float(len(visits)))
+            feats.append(float(T))
         if add_span_days:
-            feats.append(span_days)
+            feats.append(float(DT.sum()))
 
         rows.append(feats)
-        ys.append(float(y))
+        ys.append(y)
         pids.append(pid)
 
     X_df = pd.DataFrame(rows, columns=feat_names, dtype=float)
@@ -329,7 +175,8 @@ def train_xgb(
 # 4) K-fold CV driver (train/test only)
 # --------------------------
 def run_xgb_cv(
-    pkl_path: Path | str = PROCESSED_DATA_DIR / "NEW_COPD_PATIENTS_DATA.pkl",
+    # pkl_path: str = "data/processed/COPD_PATIENTS_DATA.pkl",
+    pkl_path: str = "data/processed/NEW_COPD_PATIENTS_DATA.pkl",
     out_dir: str = "models/xgb_cv_no_es",
     *,
     k_folds: int = 5,
@@ -343,11 +190,24 @@ def run_xgb_cv(
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
-    X_df, y_s, feature_names, pids = build_xgb_tabular_from_pkl(pkl_path)
-    pids_all = np.array(pids)
-    N = len(X_df)
+    # Build dataset (include age/gender/dt if desired in aggregates)
+    # ds = TimeSeriesDataset(
+    #     pkl_path,
+    #     include_age=True,
+    #     include_gender=True,
+    #     include_dt_feature=True,
+    # )
+    # ds = TimeSeriesDataset(compute=False)
+    ds = TimeSeriesDataset(compute=True)
+    print(f"{len(ds)=}")
+
+    N = len(ds)
     if N < k_folds:
         raise ValueError(f"Dataset too small for {k_folds}-fold CV: N={N}")
+
+    # Build tabular features once
+    X_df, y_s, feature_names, pids = build_tabular_from_dataset(ds)
+    pids_all = np.array(pids)
     X_all = X_df.values
     y_all = y_s.values
 
@@ -453,7 +313,7 @@ def run_xgb_cv(
 # --------------------------
 if __name__ == "__main__":
     run_xgb_cv(
-        pkl_path=PROCESSED_DATA_DIR / "NEW_COPD_PATIENTS_DATA.pkl",
+        pkl_path="data/processed/NEW_COPD_PATIENTS_DATA.pkl",
         out_dir="models/xgb_cv_no_es",
         k_folds=5,
         seed=42,
